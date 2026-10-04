@@ -1,0 +1,11 @@
+# Your WiFi and Telegram credentials - never commit
+claude_desk_buddy/secrets.h
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# The old single-file copy of the sketch (now claude_desk_buddy/claude_desk_buddy.ino)
+working_example_memento_board.ino
+tracker_test.py
