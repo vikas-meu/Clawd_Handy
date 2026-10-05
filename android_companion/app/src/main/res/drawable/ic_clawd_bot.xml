@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Clawd, the pixel bot from the handheld, centred in the 108dp adaptive-icon safe zone -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- body, arms, legs -->
+    <path android:fillColor="#D97757" android:pathData="M33,40h42v24h-42z" />
+    <path android:fillColor="#D97757" android:pathData="M27,46h6v6h-6z M75,40h6v6h-6z M81,34h6v6h-6z" />
+    <path android:fillColor="#D97757" android:pathData="M39,64h3v6h-3z M45,64h3v6h-3z M60,64h3v6h-3z M66,64h3v6h-3z" />
+    <!-- eyes -->
+    <path android:fillColor="#141413" android:pathData="M39,45h6v9h-6z M63,45h6v9h-6z" />
+</vector>

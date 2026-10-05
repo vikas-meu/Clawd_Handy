@@ -32,7 +32,7 @@
   <circle r="6" fill="#faf9f5"><animateMotion dur="2.8s" begin="1.4s" repeatCount="indefinite" keyPoints="1;0" keyTimes="0;1" calcMode="linear"><mpath href="#w3"/></animateMotion></circle>
   <circle r="5" fill="#5ba3f8"><animateMotion dur="1.8s" repeatCount="indefinite"><mpath href="#w4"/></animateMotion></circle>
 
-  <text class="label" x="270" y="160">usage, photos, frames</text>
+  <text class="label" x="270" y="160">voice, photos, GPS, frames</text>
   <text class="label" x="270" y="176">LAN / HTTP :8765</text>
   <text class="label" x="612" y="86">HTTPS</text>
   <text class="label" x="612" y="160">%, answers</text>
@@ -56,25 +56,25 @@
   <text class="item" x="58" y="300">Alarms · Games · World Live</text>
   <text class="item" x="58" y="318">Toolbox · Idle clock</text>
 
-  <!-- your PC -->
+  <!-- Android companion -->
   <rect class="box" x="382" y="30" width="220" height="170" rx="14"/>
-  <text class="title" x="400" y="60">Your PC</text>
-  <text class="sub" x="400" y="78">claude_bridge.py</text>
-  <text class="item" x="400" y="104">• plan usage from your</text>
-  <text class="item" x="412" y="120">Claude Code login</text>
-  <text class="item" x="400" y="140">• asks Claude about photos</text>
-  <text class="item" x="400" y="160">• OpenCV: faces + QR codes</text>
-  <text class="item" x="400" y="180">• answers LAN discovery</text>
+  <text class="title" x="400" y="60">Your Android phone</text>
+  <text class="sub" x="400" y="78">CLAWD COMPANION APP</text>
+  <text class="item" x="400" y="104">• listens for push-to-talk</text>
+  <text class="item" x="400" y="124">• Claude: ask, see, translate</text>
+  <text class="item" x="400" y="144">• acts: alarms, music, maps</text>
+  <text class="item" x="400" y="164">• live GPS for weather</text>
+  <text class="item" x="400" y="184">• ML Kit faces + QR codes</text>
 
   <!-- Anthropic -->
   <rect class="box" x="718" y="30" width="212" height="170" rx="14"/>
   <text class="title" x="736" y="60">Anthropic</text>
   <text class="sub" x="736" y="78">API.ANTHROPIC.COM</text>
-  <text class="item" x="736" y="108">• usage (5 h session,</text>
-  <text class="item" x="748" y="124">7 day weekly)</text>
-  <text class="item" x="736" y="148">• Messages API:</text>
-  <text class="item" x="748" y="164">Claude reads the photo,</text>
-  <text class="item" x="748" y="180">replies in &lt; 35 words</text>
+  <text class="item" x="736" y="108">• Messages API:</text>
+  <text class="item" x="748" y="128">photos, voice questions,</text>
+  <text class="item" x="748" y="146">web search, tool use,</text>
+  <text class="item" x="748" y="164">translations</text>
+  <text class="item" x="736" y="184">• API billed separately</text>
 
   <!-- free web data -->
   <rect class="box" x="382" y="330" width="220" height="150" rx="14"/>
@@ -89,15 +89,15 @@
   <rect class="box" x="70" y="398" width="160" height="92" rx="14"/>
   <rect x="88" y="414" width="30" height="58" rx="6" fill="none" stroke="#5ba3f8" stroke-width="2"/>
   <circle class="blink" cx="103" cy="464" r="2.5" fill="#5ba3f8"/>
-  <text class="title" x="128" y="436">Phone</text>
+  <text class="title" x="128" y="436">Remote</text>
   <text class="item" x="128" y="456">clawd.local</text>
 
   <!-- legend -->
   <circle cx="660" cy="430" r="6" fill="#d97757"/><text class="label" x="672" y="434">request</text>
   <circle cx="660" cy="452" r="6" fill="#faf9f5"/><text class="label" x="672" y="456">answer</text>
   <circle cx="660" cy="474" r="5" fill="#5ba3f8"/><text class="label" x="672" y="478">your phone</text>
-  <text class="label" x="760" y="434">Usage, Ask, faces and QR</text>
-  <text class="label" x="760" y="452">go through the PC bridge;</text>
-  <text class="label" x="760" y="470">everything else needs</text>
-  <text class="label" x="760" y="488">only WiFi.</text>
+  <text class="label" x="760" y="434">Pairing token protects</text>
+  <text class="label" x="760" y="452">phone services on trusted</text>
+  <text class="label" x="760" y="470">local WiFi. Web feeds</text>
+  <text class="label" x="760" y="488">come directly from board.</text>
 </svg>

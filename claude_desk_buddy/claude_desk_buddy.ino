@@ -31,16 +31,26 @@
 #include <qrcode.h>
 // Claude screens (declared up here so Arduino's auto-generated prototypes can see them)
 enum Face { FACE_NORMAL, FACE_BLINK, FACE_HAPPY, FACE_WORRIED, FACE_DEAD, FACE_LOOK_LEFT, FACE_LOOK_RIGHT };
-enum NetJob { JOB_NONE, JOB_USAGE, JOB_ASK_IMAGE, JOB_FACE, JOB_WEB, JOB_QR };
+enum NetJob { JOB_NONE, JOB_USAGE, JOB_ASK_IMAGE, JOB_FACE, JOB_WEB, JOB_QR, JOB_LOCATION, JOB_LISTEN, JOB_TALK };
+enum TalkState { TALK_IDLE, TALK_LISTENING, TALK_THINKING, TALK_ANSWER };
 enum AskState { ASK_PREVIEW, ASK_THINKING, ASK_ANSWER };
 struct Alarm { bool on; uint8_t hour, minute, repeat; };
-// --- CREDENTIALS --- (WiFi + Telegram live in secrets.h, which is not committed)
-#include "secrets.h"
+// ===================== YOUR SETTINGS =====================
+// Put your own values here. Lines ending in "// private" are swapped back to these placeholders
+// whenever you commit (see tools/private_values.py), so they never reach GitHub; your copy keeps
+// them. If you use your phone's hotspot, set it to 2.4 GHz ("Extend compatibility").
+#define WIFI_SSID "your-wifi-name" // private
+#define WIFI_PASSWORD "your-wifi-password" // private
+// Telegram bot (Home Assistant mode). Leave as-is if you don't use it.
+#define BOTtoken "123456789:your-telegram-bot-token" // private
+#define CHAT_ID "your-telegram-chat-id" // private
+// The Clawd Phone app (android_companion/) is the bridge. The board finds it by itself, on home
+// WiFi or on the phone's own hotspot, and pairs when you tap "Pair handheld" in the app.
+// Only fill these in if automatic finding or pairing doesn't work for you.
+#define BRIDGE_URL "" // private  e.g. "http://192.168.1.42:8765"
+#define BRIDGE_TOKEN "" // private  the pairing token shown in the app
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
-// PC running claude_bridge.py (it prints the exact line to paste here when it starts).
-// If the PC's IP changes, the board finds the bridge again by itself.
-#define BRIDGE_URL "http://10.66.196.249:8765"
 // Pin definitions
 #define MIC 20
 #define SPEAKER 18
@@ -107,12 +117,13 @@ enum Mode {
   MODE_WORLD,
   MODE_PET,
   MODE_TOOLS,
-  MODE_TOOL
+  MODE_TOOL,
+  MODE_TALK
 };
 Mode currentMode = MODE_IDLE;
 int menuSelection = 0;
-const char* menuOptions[] = {"Claude Usage", "Claude Ask", "Claude Dance", "Clawd Pet", "Alarms", "Face Finder",
-                             "World Live", "Games", "Toolbox", "Camera Mode", "Home Assistant"};
+const char* menuOptions[] = {"Clawd Talk", "Claude Ask", "API Status", "Claude Dance", "Clawd Pet", "Alarms",
+                             "Face Finder", "World Live", "Games", "Toolbox", "Camera Mode", "Home Assistant"};
 int numMenuOptions = sizeof(menuOptions) / sizeof(menuOptions[0]);
 // Function prototypes
 void drawMenu();
@@ -371,8 +382,14 @@ const char *netContentType = "";
 int netStatus = 0;
 String netResponse;
 TaskHandle_t netTaskHandle = NULL;
-String bridgeUrl = BRIDGE_URL; // replaced automatically if the bridge turns up at another IP
-// Broadcasts "where are you?" on the LAN; claude_bridge.py answers from the PC's current IP
+Preferences prefs;             // flash storage: alarms, clock, scores, pet, reminders, phone address
+String bridgeUrl = BRIDGE_URL; // replaced automatically when the phone turns up at another IP
+volatile bool bridgeMoved = false; // the net task found the phone somewhere new; loop() saves it
+String bridgeToken = BRIDGE_TOKEN; // pairing token: from YOUR SETTINGS, or fetched when you pair
+volatile bool bridgeTokenChanged = false;
+// Free IP-based location, used when the phone can't share its GPS
+#define IP_LOCATE_URL "https://ipwho.is/?fields=success,city,latitude,longitude"
+// Broadcasts "where are you?" on the LAN; the phone app answers from its current IP.
 bool discoverBridge() {
   WiFiUDP udp;
   if (!udp.begin(8767)) return false;
@@ -387,8 +404,12 @@ bool discoverBridge() {
       udp.read(reply, sizeof(reply) - 1);
       int port = 0;
       if (sscanf(reply, "CLAUDE_BRIDGE %d", &port) == 1) {
-        bridgeUrl = "http://" + udp.remoteIP().toString() + ":" + String(port);
-        Serial.println("Found bridge at " + bridgeUrl);
+        String url = "http://" + udp.remoteIP().toString() + ":" + String(port);
+        if (url != bridgeUrl) {
+          bridgeUrl = url;
+          bridgeMoved = true;
+        }
+        Serial.println("Found the phone at " + bridgeUrl);
         found = true;
       }
     }
@@ -398,11 +419,14 @@ bool discoverBridge() {
   return found;
 }
 int bridgeRequest() {
+  if (!bridgeUrl.length()) return -1;
   HTTPClient http;
-  http.setConnectTimeout(4000);
-  http.setTimeout(netJob == JOB_ASK_IMAGE ? 60000 : 10000); // Claude can take a while
+  http.setConnectTimeout(3000);
+  // Claude (and web searches) can take a while; listening lasts until you stop talking
+  http.setTimeout(netJob == JOB_ASK_IMAGE || netJob == JOB_TALK ? 75000 : netJob == JOB_LISTEN ? 30000 : 10000);
   int status = -1;
   if (http.begin(bridgeUrl + netPath)) {
+    if (bridgeToken.length()) http.addHeader("X-Clawd-Token", bridgeToken);
     if (netBody) {
       http.addHeader("Content-Type", netContentType);
       status = http.POST(netBody, netBodyLen);
@@ -413,6 +437,48 @@ int bridgeRequest() {
     http.end();
   }
   return status;
+}
+// On the phone's hotspot the phone is our gateway, and hotspots often swallow the discovery
+// broadcast, so try the gateway's address directly
+int gatewayRequest() {
+  IPAddress gw = WiFi.gatewayIP();
+  String url = "http://" + gw.toString() + ":8765";
+  if (gw == IPAddress(0, 0, 0, 0) || url == bridgeUrl) return -1;
+  String before = bridgeUrl;
+  bridgeUrl = url;
+  int status = bridgeRequest();
+  if (status > 0 && netResponse.indexOf("\"ok\"") >= 0) { // it's the Clawd Phone app
+    bridgeMoved = true;
+    Serial.println("Found the phone at the gateway, " + bridgeUrl);
+    return status;
+  }
+  bridgeUrl = before;
+  netResponse = "";
+  return -1;
+}
+// The app was refused our token (or we have none): ask for it. The phone only hands it out for
+// two minutes after you tap "Pair handheld" (or switch the link on) in the app.
+bool pairWithPhone() {
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
+  bool paired = false;
+  if (http.begin(bridgeUrl + "/pair")) {
+    if (http.GET() == 200) {
+      JsonDocument doc;
+      if (!deserializeJson(doc, http.getString()) && (doc["ok"] | false)) {
+        String token = doc["token"] | "";
+        if (token.length()) {
+          bridgeToken = token;
+          bridgeTokenChanged = true;
+          paired = true;
+          Serial.println("Paired with the phone");
+        }
+      }
+    }
+    http.end();
+  }
+  return paired;
 }
 // Plain HTTPS GET to a public web API (netPath holds the full URL)
 int webRequest() {
@@ -437,8 +503,20 @@ void netTask(void *) {
     if (netJob == JOB_WEB) {
       netStatus = webRequest();
     } else {
+      // Try the last known address first; only search for the phone when it isn't there
       netStatus = bridgeRequest();
-      if (netStatus < 0 && discoverBridge()) netStatus = bridgeRequest(); // PC moved? retry once
+      if (netStatus < 0 && discoverBridge()) netStatus = bridgeRequest();
+      if (netStatus < 0) netStatus = gatewayRequest();
+      if (netStatus == 401 && pairWithPhone()) {
+        netResponse = "";
+        netStatus = bridgeRequest();
+      }
+      // No phone GPS (app closed, or permission off): fall back to IP-based location
+      if (netJob == JOB_LOCATION && (netStatus != 200 || netResponse.indexOf("\"success\":true") < 0)) {
+        netResponse = "";
+        netPath = IP_LOCATE_URL;
+        netStatus = webRequest();
+      }
     }
     netDone = true;
   }
@@ -707,71 +785,84 @@ void danceMode() {
   drawDance();
 }
 
-// ===================== CLAUDE USAGE =====================
-struct UsageInfo {
-  bool valid = false;
-  float sessionPct = 0, weeklyPct = 0;
-  String sessionReset, weeklyReset, plan, error;
-  int rows = 0;
-  String rowName[4];
-  int rowPct[4];
+// ===================== API STATUS (phone link) =====================
+// The phone app counts the Claude requests it makes for you today and reports its battery and
+// where it is. The board asks once a minute. Voice commands said into the phone app (like
+// "set an alarm for 7") ride along on that reply as actions for the board.
+struct PhoneInfo {
+  bool valid = false; // had at least one good reply
+  String error;
+  unsigned long requests = 0, inputTokens = 0, outputTokens = 0;
+  int battery = -1;
+  bool charging = false;
+  String city;
   unsigned long fetchedAt = 0;
 } usage;
-float shownSession = 0, shownWeekly = 0; // animated bar values chasing the real ones
-int usagePage = 0;                       // 0 = session/weekly, 1 = weekly breakdown by app
+int usagePage = 0; // 0 = today's Claude use, 1 = the phone link
 unsigned long lastUsagePoll = 0;
 const unsigned long USAGE_POLL_MS = 60000;
-int alertLevel = 0;                      // 1 = warned at 80%, 2 = warned at 100%
 unsigned long waveUntil = 0;
-void requestUsage(bool fresh) {
+void runBoardActions(JsonArray actions, String *summary); // in CLAWD TALK
+void requestUsage() {
   lastUsagePoll = millis();
-  startNetJob(JOB_USAGE, fresh ? "/usage?fresh=1" : "/usage", NULL, 0, "");
+  startNetJob(JOB_USAGE, "/usage", NULL, 0, "");
+}
+bool phoneOnline() {
+  return usage.valid && usage.error.length() == 0;
+}
+// Why a phone request failed, in words that say what to do about it
+String phoneError(int status) {
+  if (status < 0) return "Can't find the Clawd Phone app on this WiFi.";
+  if (status == 401) return "Not paired. In the phone app, tap Pair handheld.";
+  return "Phone app error " + String(status);
 }
 void handleUsageResult(bool parsed, JsonDocument &doc) {
   if (!parsed) {
-    usage.error = netStatus < 0 ? "No bridge at " + bridgeUrl.substring(7) + " - is claude_bridge.py running?"
-                                : "Bridge error " + String(netStatus);
+    usage.error = phoneError(netStatus);
     return;
   }
   if (!(doc["ok"] | false)) {
     usage.error = (const char *)(doc["error"] | "Unknown error");
     return;
   }
-  float oldSession = usage.sessionPct;
+  unsigned long before = usage.requests;
+  usage.requests = doc["today"]["requests"] | 0UL;
+  usage.inputTokens = doc["today"]["input_tokens"] | 0UL;
+  usage.outputTokens = doc["today"]["output_tokens"] | 0UL;
+  usage.battery = doc["phone"]["battery"] | -1;
+  usage.charging = doc["phone"]["charging"] | false;
+  usage.city = (const char *)(doc["phone"]["city"] | "");
+  if (usage.valid && usage.requests != before) waveUntil = millis() + 1500;
   usage.valid = true;
   usage.error = "";
-  usage.plan = (const char *)(doc["plan"] | "");
-  usage.sessionPct = doc["session"]["pct"] | 0.0f;
-  usage.sessionReset = (const char *)(doc["session"]["resets"] | "");
-  usage.weeklyPct = doc["weekly"]["pct"] | 0.0f;
-  usage.weeklyReset = (const char *)(doc["weekly"]["resets"] | "");
-  usage.rows = 0;
-  for (JsonObject row : doc["breakdown"].as<JsonArray>()) {
-    if (usage.rows >= 4) break;
-    usage.rowName[usage.rows] = (const char *)(row["name"] | "");
-    usage.rowPct[usage.rows] = row["pct"] | 0;
-    usage.rows++;
-  }
   usage.fetchedAt = millis();
-  if (fabsf(usage.sessionPct - oldSession) >= 1.0f) waveUntil = millis() + 1500;
-  // Beep once when the session crosses 80%, and again at 100%
-  int level = usage.sessionPct >= 100 ? 2 : usage.sessionPct >= 80 ? 1 : 0;
-  if (level > alertLevel && !danceOn) { // the dance owns the speaker
-    for (int i = 0; i <= level; i++) {
-      pycamera.speaker_tone(1500, 80);
-      delay(60);
-    }
+  runBoardActions(doc["actions"].as<JsonArray>(), NULL);
+}
+String compactUsageCount(unsigned long value) {
+  char buf[12];
+  if (value >= 1000000UL) snprintf(buf, sizeof(buf), "%.1fM", value / 1000000.0f);
+  else if (value >= 10000UL) snprintf(buf, sizeof(buf), "%.0fk", value / 1000.0f);
+  else if (value >= 1000UL) snprintf(buf, sizeof(buf), "%.1fk", value / 1000.0f);
+  else snprintf(buf, sizeof(buf), "%lu", value);
+  return String(buf);
+}
+// Little phone with its battery level, right-aligned at x; red outline when the phone is gone
+void drawPhoneChip(Adafruit_GFX *g, int right, int y) {
+  bool on = phoneOnline();
+  bool lost = usage.error.length() > 0; // no reply yet is neither: still looking
+  String pct = on ? (usage.battery >= 0 ? String(usage.battery) + "%" : String("")) : lost ? String("off") : String("...");
+  int w = 10 + pct.length() * 6;
+  int x = right - w;
+  uint16_t c = on ? (usage.battery >= 0 && usage.battery <= 15 ? CLAUDE_RED : CLAUDE_CREAM) : lost ? CLAUDE_RED : CLAUDE_GRAY;
+  g->drawRoundRect(x, y, 7, 12, 2, c);
+  if (on && usage.battery >= 0) {
+    int h = max(1, 8 * usage.battery / 100);
+    g->fillRect(x + 2, y + 10 - h, 3, h, usage.charging ? CLAUDE_GREEN : c);
   }
-  alertLevel = level;
-}
-uint16_t levelColor(float pct) {
-  return pct >= 90 ? CLAUDE_RED : pct >= 70 ? CLAUDE_AMBER : CLAUDE_ORANGE;
-}
-const char *usageQuip(float pct) {
-  if (pct >= 100) return "Limit reached. Coffee break?";
-  if (pct >= 80) return "Running low! Save it for the big stuff.";
-  if (pct >= 50) return "Past halfway. Pace yourself.";
-  return "Plenty of room. Let's build something!";
+  g->setTextSize(1);
+  g->setTextColor(c);
+  g->setCursor(x + 10, y + 3);
+  g->print(pct);
 }
 void drawUsageHeader(const char *title) {
   ui->fillScreen(CLAUDE_DARK);
@@ -780,18 +871,10 @@ void drawUsageHeader(const char *title) {
   ui->setTextColor(CLAUDE_CREAM);
   ui->setCursor(38, 11);
   ui->print(title);
-  if (usage.plan.length()) {
-    int w = usage.plan.length() * 6 + 8;
-    ui->drawRoundRect(232 - w, 11, w, 15, 4, CLAUDE_ORANGE);
-    ui->setTextSize(1);
-    ui->setTextColor(CLAUDE_ORANGE);
-    ui->setCursor(236 - w, 15);
-    ui->print(usage.plan);
-  }
+  drawPhoneChip(ui, 232, 12);
 }
 void drawUsageFooter(unsigned long now) {
-  bool online = usage.valid && usage.error.length() == 0;
-  ui->fillCircle(10, 229, 3, online ? CLAUDE_GREEN : CLAUDE_RED);
+  ui->fillCircle(10, 229, 3, phoneOnline() ? CLAUDE_GREEN : CLAUDE_RED);
   ui->setTextSize(1);
   ui->setTextColor(CLAUDE_GRAY);
   ui->setCursor(18, 226);
@@ -807,48 +890,41 @@ void drawUsageFooter(unsigned long now) {
   ui->setCursor(128, 226);
   ui->print("<> page  OK reload");
 }
-// Label, big percentage, rounded bar and "Resets in ..." line, starting at y
-void drawUsageBar(int y, const char *label, const char *span, float pct, const String &reset) {
-  ui->setTextSize(2);
-  ui->setTextColor(CLAUDE_CREAM);
-  ui->setCursor(12, y);
-  ui->print(label);
+void drawUsageMain(unsigned long now) {
+  drawUsageHeader("API Status");
   ui->setTextSize(1);
   ui->setTextColor(CLAUDE_GRAY);
-  ui->setCursor(ui->getCursorX() + 4, y + 6);
-  ui->print(span);
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%d%%", (int)(pct + 0.5f));
+  ui->setCursor(14, 42);
+  ui->print("CLAUDE REQUESTS TODAY");
+  ui->setTextSize(4);
+  ui->setTextColor(CLAUDE_ORANGE);
+  ui->setCursor(12, 57);
+  ui->print(compactUsageCount(usage.requests));
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(17, 99);
+  ui->print("asks, photos, chats & translations");
+  ui->drawRoundRect(12, 119, 104, 34, 7, CLAUDE_TRACK);
+  ui->drawRoundRect(124, 119, 104, 34, 7, CLAUDE_TRACK);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(20, 125);
+  ui->print("TOKENS IN");
+  ui->setCursor(132, 125);
+  ui->print("TOKENS OUT");
   ui->setTextSize(2);
-  ui->setTextColor(levelColor(pct));
-  ui->setCursor(228 - strlen(buf) * 12, y);
-  ui->print(buf);
-  ui->fillRoundRect(12, y + 22, 216, 12, 6, CLAUDE_TRACK);
-  int fw = constrain((int)(216 * pct / 100.0f), 0, 216);
-  if (fw > 0) ui->fillRoundRect(12, y + 22, max(fw, 12), 12, 6, levelColor(pct));
-  if (reset.length()) {
-    ui->setTextSize(1);
-    ui->setTextColor(CLAUDE_GRAY);
-    ui->setCursor(12, y + 40);
-    ui->print("Resets in " + reset);
-  }
-}
-void drawUsageMain(unsigned long now) {
-  drawUsageHeader("Claude Usage");
-  drawUsageBar(42, "Session", "(5hr)", shownSession, usage.sessionReset);
-  drawUsageBar(102, "Weekly", "(7 day)", shownWeekly, usage.weeklyReset);
-  // Mood bot: its face and quip follow whichever limit is closer to running out
-  float worst = max(usage.sessionPct, usage.weeklyPct);
-  Face face = !usage.valid || usage.error.length() ? FACE_WORRIED
-              : worst >= 100 ? FACE_DEAD
-              : worst >= 80  ? FACE_WORRIED
-              : worst >= 50  ? FACE_NORMAL
-                             : FACE_HAPPY;
-  if (face != FACE_DEAD && now % 4000 < 150) face = FACE_BLINK;
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(20, 137);
+  ui->print(compactUsageCount(usage.inputTokens));
+  ui->setCursor(132, 137);
+  ui->print(compactUsageCount(usage.outputTokens));
+  Face face = !phoneOnline() ? FACE_WORRIED : FACE_HAPPY;
+  if (now % 4000 < 150) face = FACE_BLINK;
   int arm = now < waveUntil ? ((now / 180) % 2 ? 2 : 1) : 0;
   drawBot(ui, 20, 180, 6, face, arm, 0);
   drawBubble(ui, 76, 164, 156, 46, 66, 192);
-  String quip = usage.error.length() ? usage.error : usage.valid ? String(usageQuip(worst)) : String("Fetching your usage...");
+  String quip = usage.error.length() ? usage.error
+                : usage.valid        ? String("Counted on your phone. Billed to your API key, not a Claude plan.")
+                                     : String("Looking for the phone app...");
   String lines[3];
   int n = wrapText(quip, 23, lines, 3);
   ui->setTextSize(1);
@@ -859,43 +935,44 @@ void drawUsageMain(unsigned long now) {
   }
   drawUsageFooter(now);
 }
-void drawUsageBreakdown(unsigned long now) {
-  drawUsageHeader("This week");
-  if (usage.rows == 0) {
-    ui->setTextSize(1);
-    ui->setTextColor(CLAUDE_GRAY);
-    ui->setCursor(12, 60);
-    ui->print("No breakdown yet");
-  }
-  for (int i = 0; i < usage.rows; i++) {
-    int y = 46 + i * 42;
-    ui->setTextSize(2);
-    ui->setTextColor(CLAUDE_CREAM);
-    ui->setCursor(12, y);
-    ui->print(usage.rowName[i]);
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d%%", usage.rowPct[i]);
-    ui->setTextColor(CLAUDE_ORANGE);
-    ui->setCursor(228 - strlen(buf) * 12, y);
-    ui->print(buf);
-    ui->fillRoundRect(12, y + 20, 216, 8, 4, CLAUDE_TRACK);
-    int fw = 216 * constrain(usage.rowPct[i], 0, 100) / 100;
-    if (fw > 0) ui->fillRoundRect(12, y + 20, max(fw, 8), 8, 4, CLAUDE_ORANGE);
+void drawStatusRow(int y, const char *label, const String &value, uint16_t color) {
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(14, y);
+  ui->print(label);
+  String v = value.length() > 24 ? value.substring(0, 23) + "." : value;
+  ui->setTextColor(color);
+  ui->setCursor(226 - v.length() * 6, y);
+  ui->print(v);
+  ui->drawFastHLine(14, y + 14, 212, CLAUDE_TRACK);
+}
+extern bool locationKnown;
+extern String myCity, locationSource;
+void drawUsagePhone(unsigned long now) {
+  drawUsageHeader("Phone Link");
+  drawStatusRow(46, "Status", phoneOnline() ? String("Connected") : usage.valid ? String("Lost") : String("Not found"),
+                phoneOnline() ? CLAUDE_GREEN : CLAUDE_RED);
+  drawStatusRow(70, "Address", bridgeUrl.length() ? bridgeUrl.substring(7) : String("searching..."), CLAUDE_CREAM);
+  drawStatusRow(94, "Paired", bridgeToken.length() ? String("yes") : String("tap Pair handheld in app"),
+                bridgeToken.length() ? CLAUDE_CREAM : CLAUDE_AMBER);
+  drawStatusRow(118, "Battery", usage.battery >= 0 ? String(usage.battery) + "%" + (usage.charging ? " charging" : "") : String("-"),
+                CLAUDE_CREAM);
+  drawStatusRow(142, "Location", locationKnown ? (myCity.length() ? myCity : String("known")) : String("unknown"), CLAUDE_CREAM);
+  drawStatusRow(166, "From", locationKnown ? locationSource : String("-"), CLAUDE_CREAM);
+  if (usage.error.length()) {
+    String lines[2];
+    int n = wrapText(usage.error, 36, lines, 2);
+    ui->setTextColor(CLAUDE_AMBER);
+    for (int i = 0; i < n; i++) {
+      ui->setCursor(14, 192 + i * 11);
+      ui->print(lines[i]);
+    }
   }
   drawUsageFooter(now);
 }
-// Animate a shown value toward its target; returns true while still moving
-bool chase(float &shown, float target) {
-  if (fabsf(target - shown) < 0.3f) {
-    shown = target;
-    return false;
-  }
-  shown += (target - shown) * 0.15f;
-  return true;
-}
 void usageMode() {
   if (pycamera.justPressed(AWEXP_BUTTON_OK)) {
-    requestUsage(true);
+    requestUsage();
     pycamera.speaker_tone(1200, 20);
   }
   if (pycamera.justPressed(AWEXP_BUTTON_LEFT) || pycamera.justPressed(AWEXP_BUTTON_RIGHT)) usagePage ^= 1;
@@ -904,16 +981,21 @@ void usageMode() {
   unsigned long now = millis();
   if (now - lastDraw < 66) return; // ~15 fps is plenty
   lastDraw = now;
-  chase(shownSession, usage.sessionPct);
-  chase(shownWeekly, usage.weeklyPct);
   if (usagePage == 0) drawUsageMain(now);
-  else drawUsageBreakdown(now);
+  else drawUsagePhone(now);
   pushUi();
 }
 
 // ===================== CLAUDE ASK =====================
-// Point the camera at something and press Shutter (or OK): Claude says what it is, or solves it
+// Point the camera at something and press Shutter (or OK): Claude says what it is, or solves it.
+// LEFT/RIGHT on the camera view switches to Translate: signs, menus and labels in your language.
 #define ASK_MAX_LINES 30
+// Languages for Translate here and in Clawd Talk (sent to the phone by name)
+const char *LANGS[] = {"English", "Hindi", "Spanish", "French", "German", "Japanese", "Chinese",
+                       "Arabic", "Bengali", "Tamil", "Telugu", "Marathi", "Italian", "Korean", "Russian"};
+#define LANG_COUNT (sizeof(LANGS) / sizeof(LANGS[0]))
+int langSel = 0; // the language Translate turns things into (saved)
+bool askTranslate = false;
 AskState askState = ASK_PREVIEW;
 bool askFailed = false;
 bool askNeedsDraw = true;
@@ -944,8 +1026,7 @@ void showAskResult(const String &answer, bool failed) {
 }
 void handleAskResult(bool parsed, JsonDocument &doc) {
   if (!parsed) {
-    String msg = netStatus < 0 ? String("Can't reach the bridge on your PC.") : "Bridge error " + String(netStatus);
-    showAskResult(msg, true);
+    showAskResult(phoneError(netStatus), true);
     return;
   }
   showAskResult((const char *)(doc["answer"] | ""), !(doc["ok"] | false));
@@ -953,8 +1034,18 @@ void handleAskResult(bool parsed, JsonDocument &doc) {
 void handleFaceResult(bool parsed, JsonDocument &doc);
 void handleWebResult(int status, const String &body);
 void handleQrResult(bool parsed, JsonDocument &doc);
+void handleListenResult(bool parsed, JsonDocument &doc);
+void handleTalkResult(bool parsed, JsonDocument &doc);
 // Called every loop(): hands a finished network job's result to its screen
 void serviceNetJob() {
+  if (bridgeMoved) { // remember where the phone was, for a quicker start next boot
+    bridgeMoved = false;
+    prefs.putString("bridge", bridgeUrl);
+  }
+  if (bridgeTokenChanged) { // and the pairing token, so it only has to pair once
+    bridgeTokenChanged = false;
+    prefs.putString("token", bridgeToken);
+  }
   if (!netDone) return;
   NetJob job = netJob;
   netDone = false;
@@ -962,7 +1053,7 @@ void serviceNetJob() {
     free(netBody);
     netBody = NULL;
   }
-  if (job == JOB_WEB) {
+  if (job == JOB_WEB || job == JOB_LOCATION) {
     handleWebResult(netStatus, netResponse);
   } else {
     JsonDocument doc;
@@ -970,6 +1061,8 @@ void serviceNetJob() {
     if (job == JOB_USAGE) handleUsageResult(parsed, doc);
     else if (job == JOB_FACE) handleFaceResult(parsed, doc);
     else if (job == JOB_QR) handleQrResult(parsed, doc);
+    else if (job == JOB_LISTEN) handleListenResult(parsed, doc);
+    else if (job == JOB_TALK) handleTalkResult(parsed, doc);
     else handleAskResult(parsed, doc);
   }
   netResponse = "";
@@ -1013,9 +1106,10 @@ void askWithPhoto() {
     showAskResult("Camera capture failed.", true);
     return;
   }
-  if (!waitNetIdle(8000) || !startNetJob(JOB_ASK_IMAGE, "/ask/image", jpg, len, "image/jpeg")) {
+  String path = askTranslate ? "/ask/image?mode=translate&lang=" + String(LANGS[langSel]) : String("/ask/image?mode=look");
+  if (!waitNetIdle(8000) || !startNetJob(JOB_ASK_IMAGE, path, jpg, len, "image/jpeg")) {
     free(jpg);
-    showAskResult("No connection to the bridge.", true);
+    showAskResult(WiFi.status() != WL_CONNECTED ? "No WiFi connection." : "The phone link is busy. Try again.", true);
     return;
   }
   askStartedAt = millis();
@@ -1031,10 +1125,29 @@ void askPreview() {
   fb->setTextColor(CLAUDE_CREAM);
   fb->setCursor(24, 7);
   fb->print("Claude Ask");
+  // Lens switch: Look (what is it / solve it) or Translate (into the chosen language)
+  const char *lens[2] = {"LOOK", "TRANSLATE"};
+  for (int i = 0, x = 106; i < 2; i++) {
+    int w = strlen(lens[i]) * 6 + 10;
+    bool on = askTranslate == (i == 1);
+    if (on) fb->fillRoundRect(x, 4, w, 14, 7, CLAUDE_ORANGE);
+    else fb->drawRoundRect(x, 4, w, 14, 7, CLAUDE_TRACK);
+    fb->setTextColor(on ? CLAUDE_DARK : CLAUDE_GRAY);
+    fb->setCursor(x + 5, 7);
+    fb->print(lens[i]);
+    x += w + 4;
+  }
   fb->fillRect(0, 218, 240, 22, CLAUDE_DARK);
-  fb->setCursor(18, 226);
-  fb->print("[Shutter] ask Claude about this");
+  fb->setTextColor(CLAUDE_CREAM);
+  String hint = askTranslate ? "[Shutter] to " + String(LANGS[langSel]) + "   ^v language" : String("[Shutter] ask   </> translate");
+  fb->setCursor(120 - hint.length() * 3, 226);
+  fb->print(hint);
   pycamera.blitFrame();
+  if (pycamera.justPressed(AWEXP_BUTTON_LEFT) || pycamera.justPressed(AWEXP_BUTTON_RIGHT)) askTranslate = !askTranslate;
+  if (askTranslate && (pycamera.justPressed(AWEXP_BUTTON_UP) || pycamera.justPressed(AWEXP_BUTTON_DOWN))) {
+    langSel = (langSel + (pycamera.justPressed(AWEXP_BUTTON_UP) ? LANG_COUNT - 1 : 1)) % LANG_COUNT;
+    prefs.putUChar("lang", langSel);
+  }
   if (pycamera.justPressed(SHUTTER_BUTTON) || pycamera.justPressed(AWEXP_BUTTON_OK)) askWithPhoto();
 }
 void drawThinking() {
@@ -1068,7 +1181,7 @@ void drawAnswer() {
   ui->setTextSize(1);
   ui->setTextColor(CLAUDE_GRAY);
   ui->setCursor(66, 16);
-  ui->print(askFailed ? "Something went wrong" : "About your photo");
+  ui->print(askFailed ? "Something went wrong" : askTranslate ? "In " + String(LANGS[langSel]) : String("About your photo"));
   // answer bubble, revealed like it's being typed
   drawBubble(ui, 8, 46, 224, 162, 30, 38);
   int lineH = askTextSize == 2 ? 19 : 11;
@@ -1133,7 +1246,6 @@ void askMode() {
 // Once the board knows the time it keeps counting by itself, WiFi or not. The time is also
 // saved every few minutes, so after a reboot with no WiFi the clock, alarms and reminders
 // carry on from the last saved time (shown with a "~" until internet time is back).
-Preferences prefs; // flash storage: alarms, last known time, high scores, reminders
 volatile bool timeKnown = false;  // we have a usable clock (internet or restored)
 volatile bool timeApprox = false; // restored from storage, not yet confirmed online
 unsigned long lastTimeSave = 0;
@@ -1497,8 +1609,8 @@ void alarmsMode() {
 }
 
 // ===================== FACE FINDER =====================
-// The camera streams its small preview frames to claude_bridge.py, which finds faces with
-// OpenCV. (This board's ESP32 core no longer ships Espressif's on-chip face detector.)
+// The camera streams its small preview frames to the phone app, which finds faces with
+// ML Kit on the phone. (This board's ESP32 core no longer ships Espressif's face detector.)
 struct FaceBox {
   int16_t x, y, w, h;
 };
@@ -1555,7 +1667,7 @@ void faceMode() {
   fb->setTextSize(1);
   fb->setTextColor(CLAUDE_CREAM);
   fb->setCursor(20, 5);
-  if (faceBridgeDown) fb->print("Face Finder - bridge offline");
+  if (faceBridgeDown) fb->print("Face Finder - phone offline");
   else if (faceCount == 0) fb->print("Face Finder - looking...");
   else fb->printf("Face Finder - %d face%s", faceCount, faceCount > 1 ? "s" : "");
   // Clawd in the corner keeps an eye on the first face
@@ -1580,7 +1692,8 @@ void faceMode() {
 // ===================== WORLD LIVE =====================
 // Free web data the board fetches itself over WiFi, no API keys: Open-Meteo (weather),
 // OpenSky (planes), wheretheiss.at (ISS), USGS (earthquakes) and CoinGecko (crypto).
-// Your location is guessed from your internet connection (ipwho.is) unless you pin it here.
+// Your location comes from the phone's GPS (or, without the phone, a guess from your internet
+// connection via ipwho.is) unless you pin it here.
 #define MY_LAT 0.0f // e.g. 23.2599 to pin your location; 0 = automatic
 #define MY_LON 0.0f
 #define W_WEATHER 0
@@ -1602,7 +1715,18 @@ int webWidget = -1; // which widget the running web request is for
 float myLat = MY_LAT, myLon = MY_LON;
 String myCity;
 bool locationKnown = MY_LAT != 0.0f || MY_LON != 0.0f;
+bool locationPinned = locationKnown; // MY_LAT/MY_LON set: never look it up
+String locationSource = locationPinned ? "Pinned in sketch" : "";
 bool locateTried = false;
+unsigned long locatedAt = 0;              // when the last lookup finished (0 = never)
+const unsigned long LOCATE_EVERY_MS = 15UL * 60 * 1000; // it's a pocket device: you move around
+const unsigned long LOCATE_RETRY_MS = 2UL * 60 * 1000;
+// True when it's time to ask the phone (or the internet) where we are
+bool locationDue() {
+  if (locationPinned || netBusy() || WiFi.status() != WL_CONNECTED) return false;
+  if (!locateTried) return true;
+  return millis() - locatedAt > (locationKnown ? LOCATE_EVERY_MS : LOCATE_RETRY_MS);
+}
 // Weather
 struct {
   float temp, feels, wind;
@@ -1713,8 +1837,6 @@ String withCommas(long v, bool indian) {
 String widgetUrl(int w) {
   char url[300];
   switch (w) {
-    case W_LOCATE:
-      return "https://ipwho.is/?fields=success,city,latitude,longitude";
     case W_WEATHER:
       snprintf(url, sizeof(url),
                "https://api.open-meteo.com/v1/forecast?latitude=%.3f&longitude=%.3f"
@@ -1735,7 +1857,10 @@ String widgetUrl(int w) {
   }
 }
 void requestWidget(int w) {
-  if (startNetJob(JOB_WEB, widgetUrl(w), NULL, 0, "")) {
+  bool started = w == W_LOCATE
+                     ? startNetJob(JOB_LOCATION, "/location", NULL, 0, "")
+                     : startNetJob(JOB_WEB, widgetUrl(w), NULL, 0, "");
+  if (started) {
     webWidget = w;
     wFetchedAt[w] = millis();
   }
@@ -1744,19 +1869,19 @@ void requestWidget(int w) {
 void worldTick() {
   if (netBusy()) return;
   int w = worldPage;
-  if ((w == W_WEATHER || w == W_PLANES) && !locationKnown) {
-    if (!locateTried) {
-      locateTried = true;
-      requestWidget(W_LOCATE);
-    }
+  if (locationDue()) {
+    locateTried = true;
+    requestWidget(W_LOCATE);
     return;
   }
+  if ((w == W_WEATHER || w == W_PLANES) && !locationKnown) return;
   if (!wFetchedAt[w] || millis() - wFetchedAt[w] > W_REFRESH_MS[w]) requestWidget(w);
 }
 void handleWebResult(int status, const String &body) {
   int w = webWidget;
   webWidget = -1;
   if (w < 0) return;
+  if (w == W_LOCATE) locatedAt = millis();
   if (status != 200) {
     wError[w] = status == 429 ? String("Too many requests - try later")
               : status < 0    ? String("No internet connection")
@@ -1784,9 +1909,16 @@ void handleWebResult(int status, const String &body) {
   switch (w) {
     case W_LOCATE:
       if (doc["success"] | false) {
-        myLat = doc["latitude"] | 0.0f;
-        myLon = doc["longitude"] | 0.0f;
+        float lat = doc["latitude"] | 0.0f, lon = doc["longitude"] | 0.0f;
+        if (locationKnown && distanceKm(myLat, myLon, lat, lon) > 3) { // moved: refresh what depends on it
+          wFetchedAt[W_WEATHER] = 0;
+          wFetchedAt[W_PLANES] = 0;
+          planeCount = 0;
+        }
+        myLat = lat;
+        myLon = lon;
         myCity = (const char *)(doc["city"] | "");
+        locationSource = strcmp(doc["source"] | "", "phone") == 0 ? "Phone GPS" : "Internet (IP guess)";
         locationKnown = true;
       }
       break;
@@ -2164,7 +2296,7 @@ void worldMode() {
   ui->fillCircle(230, 11, 4, loading ? CLAUDE_AMBER : wError[w].length() ? CLAUDE_RED : wHasData[w] ? CLAUDE_GREEN : CLAUDE_TRACK);
   if (!wHasData[w]) {
     String msg = wError[w].length()                                         ? wError[w]
-                 : (w == W_WEATHER || w == W_PLANES) && !locationKnown      ? String(locateTried && !netBusy() ? "Couldn't find your location" : "Finding your location...")
+                 : (w == W_WEATHER || w == W_PLANES) && !locationKnown      ? String(locateTried && webWidget != W_LOCATE ? "Couldn't find your location. Retrying..." : "Asking your phone where we are...")
                  : WiFi.status() != WL_CONNECTED                            ? String("Waiting for WiFi...")
                                                                             : String("Loading...");
     drawCentered(msg, 110, 1, CLAUDE_GRAY);
@@ -2977,7 +3109,7 @@ void petMode() {
 #define TOOL_COUNT 7
 const char *TOOL_NAMES[] = {"Pomodoro", "Spirit Level", "Photo Booth", "Timelapse", "QR Scanner", "Home Controls", "Phone Remote"};
 const char *TOOL_HINTS[] = {"Focus timer with breaks", "Is it straight?", "3-2-1 photo to the SD card",
-                            "Record a timelapse, play it back", "Read QR codes (needs the bridge)",
+                            "Record a timelapse, play it back", "Read QR codes (phone companion)",
                             "Your light, fan and robots", "Control me from your phone"};
 int toolSelection = 0, currentTool = 0;
 // Title + scrolling list of 6 rows, used by the Toolbox menu
@@ -3336,7 +3468,7 @@ void timelapseTool() {
   }
 }
 
-// ---- QR scanner: frames go to the bridge, OpenCV reads the code ----
+// ---- QR scanner: frames go to the phone app, ML Kit reads the code ----
 String qrText;
 unsigned long qrAt = 0, lastQrSend = 0;
 int16_t qrPts[8];
@@ -3383,7 +3515,7 @@ void qrTool() {
       int j = (i + 1) % 4;
       fb->drawLine(qrPts[i * 2], qrPts[i * 2 + 1], qrPts[j * 2], qrPts[j * 2 + 1], CLAUDE_GREEN);
     }
-  drawCameraTitle(fb, qrBridgeDown ? "QR Scanner - bridge offline" : "QR Scanner");
+  drawCameraTitle(fb, qrBridgeDown ? "QR Scanner - phone offline" : "QR Scanner");
   if (qrText.length()) {
     String kind = "Text", body = qrText;
     if (qrText.startsWith("http")) kind = "Link";
@@ -3623,7 +3755,7 @@ async function save(i){const t=$('t'+i).value.split(':');
 await fetch(`/api/alarm?i=${i}&h=${+t[0]}&m=${+t[1]}&r=${$('r'+i).value}&on=${$('o'+i).checked?1:0}`,{method:'POST'});load(true)}
 async function load(force){const s=await(await fetch('/api/status')).json();
 let h=`<b style="font-size:20px">${s.time}</b>${s.approx?' <small>(not synced yet)</small>':''}<br><small>Now showing: ${s.mode}</small><br><br>`;
-if(s.usage)h+=`Session ${s.usage.session}%<div class=bar><i style="width:${s.usage.session}%"></i></div>Weekly ${s.usage.weekly}%<div class=bar><i style="width:${s.usage.weekly}%"></i></div>`;
+if(s.phone)h+=`Phone link: ${s.phone.online?'connected':'lost'}${s.phone.battery>=0?' &middot; battery '+s.phone.battery+'%':''} &middot; ${s.phone.requests} Claude requests today<br><br>`;
 h+=`Clawd: food ${s.pet.food}% &middot; energy ${s.pet.energy}% &middot; fun ${s.pet.fun}%${s.pet.nap?' &middot; napping':''}`;
 $('st').innerHTML=h;const f=document.activeElement;
 if(force||!f||!['INPUT','SELECT'].includes(f.tagName))$('al').innerHTML=s.alarms.map((a,i)=>`<div class=row>
@@ -3633,7 +3765,8 @@ load(true);setInterval(load,5000)
 </script></body></html>)HTML";
 const char *modeName() {
   switch (currentMode) {
-    case MODE_USAGE: return "Claude Usage";
+    case MODE_USAGE: return "API Status";
+    case MODE_TALK: return "Clawd Talk";
     case MODE_ASK: return "Claude Ask";
     case MODE_DANCE: return "Dance";
     case MODE_PET: return "Clawd Pet";
@@ -3673,8 +3806,9 @@ void webStatus(WiFiClient &c) {
   doc["approx"] = (bool)timeApprox;
   doc["mode"] = modeName();
   if (usage.valid) {
-    doc["usage"]["session"] = (int)(usage.sessionPct + 0.5f);
-    doc["usage"]["weekly"] = (int)(usage.weeklyPct + 0.5f);
+    doc["phone"]["online"] = phoneOnline();
+    doc["phone"]["battery"] = usage.battery;
+    doc["phone"]["requests"] = usage.requests;
   }
   doc["pet"]["food"] = (int)pet.food;
   doc["pet"]["energy"] = (int)pet.energy;
@@ -3840,6 +3974,335 @@ void showBootQuote() {
   pushUi();
 }
 
+// ===================== CLAWD TALK =====================
+// Push-to-talk, like a Rabbit R1: press Shutter and talk to your phone (the board has no
+// microphone, so the phone app listens). The answer types itself out here and the phone says it
+// out loud. LEFT/RIGHT picks a mode:
+//   Ask       anything; Claude can search the web and act: "wake me at 7", "focus for 25
+//             minutes", "dance", "remind me to call mum in an hour", "play lo-fi on my phone"
+//   Translate what you say, into the language picked with UP/DOWN
+//   Note      saved to the notes in the phone app
+#define TALK_MODES 3
+const char *TALK_MODE_NAMES[] = {"Ask", "Translate", "Note"};
+const char *TALK_MODE_KEYS[] = {"ask", "translate", "note"};
+const char *TALK_HINTS[] = {"Ask anything. I can search the web, set alarms, start a focus timer or play music on your phone.",
+                            "Say something and I'll translate it. The phone speaks it out loud.",
+                            "Say a note and I'll keep it in the phone app."};
+TalkState talkState = TALK_IDLE;
+int talkMode = 0;
+String talkHeard, talkRaw; // what you said: ASCII for the screen, as heard for Claude
+String talkChip;           // what an action did, e.g. "Alarm 7:00 AM"
+bool talkFailed = false, talkSendPending = false;
+String talkLines[ASK_MAX_LINES];
+int talkLineCount = 0, talkScroll = 0, talkTextSize = 2, talkReveal = 0;
+unsigned long talkStateAt = 0, talkDanceAt = 0;
+void setTalkState(TalkState s) {
+  talkState = s;
+  talkStateAt = millis();
+}
+void openTalk() {
+  currentMode = MODE_TALK; // a question already on its way keeps going
+}
+void showTalkAnswer(const String &answer, bool failed) {
+  talkFailed = failed;
+  talkTextSize = 2;
+  talkLineCount = wrapText(answer, 17, talkLines, ASK_MAX_LINES);
+  if (talkLineCount > 6) { // too long for big text
+    talkTextSize = 1;
+    talkLineCount = wrapText(answer, 34, talkLines, ASK_MAX_LINES);
+  }
+  talkScroll = 0;
+  talkReveal = 0;
+  setTalkState(TALK_ANSWER);
+  if (danceOn) return; // the dance owns the speaker
+  if (failed) {
+    pycamera.speaker_tone(300, 150);
+  } else {
+    pycamera.speaker_tone(1046, 60);
+    pycamera.speaker_tone(1568, 90);
+  }
+}
+void startTalk() {
+  talkHeard = talkRaw = talkChip = "";
+  if (WiFi.status() != WL_CONNECTED) return showTalkAnswer("No WiFi connection.", true);
+  if (!waitNetIdle(4000) || !startNetJob(JOB_LISTEN, "/listen", NULL, 0, "")) {
+    return showTalkAnswer("The phone link is busy. Try again.", true);
+  }
+  setTalkState(TALK_LISTENING);
+  pycamera.speaker_tone(1320, 40); // "go ahead" chirp
+  pycamera.speaker_tone(1760, 60);
+  petBoost(2);
+}
+void handleListenResult(bool parsed, JsonDocument &doc) {
+  if (!parsed) return showTalkAnswer(phoneError(netStatus), true);
+  if (!(doc["ok"] | false)) return showTalkAnswer((const char *)(doc["error"] | "I didn't catch that."), true);
+  talkHeard = (const char *)(doc["text"] | "");
+  talkRaw = (const char *)(doc["raw"] | "");
+  setTalkState(TALK_THINKING);
+  talkSendPending = true; // sent from talkTick() once this job is cleared
+  if (!danceOn) pycamera.speaker_tone(988, 30);
+}
+void handleTalkResult(bool parsed, JsonDocument &doc) {
+  if (!parsed) return showTalkAnswer(phoneError(netStatus), true);
+  bool ok = doc["ok"] | false;
+  String chip;
+  if (ok) runBoardActions(doc["actions"].as<JsonArray>(), &chip);
+  talkChip = chip;
+  showTalkAnswer((const char *)(doc["answer"] | (ok ? "Done." : "Something went wrong.")), !ok);
+}
+// Things Claude decided to do on the board. summary collects a short "what I did" line;
+// without one (actions said into the phone app) the board just chirps and shows it in Talk.
+void runBoardActions(JsonArray actions, String *summary) {
+  for (JsonObject a : actions) {
+    String type = a["type"] | "";
+    String done;
+    if (type == "alarm") {
+      uint8_t h = constrain(a["hour"] | 7, 0, 23), m = constrain(a["minute"] | 0, 0, 59), r = constrain(a["repeat"] | 0, 0, 3);
+      int slot = -1;
+      for (int i = 0; i < MAX_ALARMS && slot < 0; i++)
+        if (alarms[i].hour == h && alarms[i].minute == m) slot = i; // same time: just switch it on
+      for (int i = 0; i < MAX_ALARMS && slot < 0; i++)
+        if (!alarms[i].on) slot = i;
+      if (slot < 0) slot = MAX_ALARMS - 1; // all four in use: replace the last
+      alarms[slot] = {true, h, m, r};
+      saveAlarms();
+      done = "Alarm " + clockText(h, m);
+    } else if (type == "focus") {
+      pomoWorkMin = constrain(a["minutes"] | 25, 1, 120);
+      pomoReset();
+      pomoStart();
+      done = "Focus " + String(pomoWorkMin) + " min";
+    } else if (type == "dance") {
+      talkDanceAt = millis() + 2500; // after the answer has had a moment on screen
+      done = "Dance time!";
+    } else if (type == "feed") {
+      pet.food = min(100.0f, pet.food + 25);
+      petBoost(5);
+      savePet();
+      done = "Clawd fed";
+    }
+    if (!done.length()) continue;
+    if (summary) {
+      if (summary->length()) *summary += "  ";
+      *summary += done;
+    } else {
+      talkChip = done;
+      if (!danceOn) pycamera.speaker_tone(1568, 40);
+    }
+  }
+}
+// Called every loop(), on any screen: sends what you said, and starts a requested dance
+void talkTick() {
+  if (talkSendPending && !netBusy()) {
+    talkSendPending = false;
+    JsonDocument req;
+    req["prompt"] = talkHeard;
+    req["raw"] = talkRaw;
+    req["mode"] = TALK_MODE_KEYS[talkMode];
+    req["lang"] = LANGS[langSel];
+    req["source"] = "board";
+    size_t len = measureJson(req);
+    uint8_t *body = (uint8_t *)ps_malloc(len + 1);
+    if (body) serializeJson(req, (char *)body, len + 1);
+    if (!body || !startNetJob(JOB_TALK, "/ask/text", body, len, "application/json")) {
+      free(body);
+      showTalkAnswer("Lost the phone link. Try again.", true);
+    }
+  }
+  if (talkDanceAt && millis() > talkDanceAt) {
+    talkDanceAt = 0;
+    if (currentMode != MODE_ALARM_RING) {
+      if (currentMode == MODE_SLEEP) wakeUp();
+      currentMode = MODE_DANCE;
+      startDance(0);
+      petBoost(5);
+    }
+  }
+}
+// ---- drawing
+void drawTalkHeader() {
+  ui->fillScreen(CLAUDE_DARK);
+  drawClaudeLogo(ui, 14, 14, 9, millis() * (talkState == TALK_THINKING ? 0.3f : 0.0f), CLAUDE_ORANGE);
+  ui->setTextSize(2);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(30, 7);
+  ui->print("Clawd");
+  drawPhoneChip(ui, 232, 8);
+  for (int i = 0; i < TALK_MODES; i++) { // mode tabs
+    int x = 6 + i * 77;
+    bool on = i == talkMode;
+    if (on) ui->fillRoundRect(x, 30, 74, 20, 10, CLAUDE_ORANGE);
+    else ui->drawRoundRect(x, 30, 74, 20, 10, CLAUDE_TRACK);
+    ui->setTextSize(1);
+    ui->setTextColor(on ? CLAUDE_DARK : CLAUDE_GRAY);
+    ui->setCursor(x + 37 - strlen(TALK_MODE_NAMES[i]) * 3, 36);
+    ui->print(TALK_MODE_NAMES[i]);
+  }
+}
+void drawTalkChip(int y) {
+  if (!talkChip.length()) return;
+  String chip = talkChip.length() > 36 ? talkChip.substring(0, 35) + "." : talkChip;
+  int w = chip.length() * 6 + 16;
+  ui->fillRoundRect(120 - w / 2, y, w, 15, 7, CLAUDE_ORANGE);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_DARK);
+  ui->setCursor(120 - w / 2 + 8, y + 4);
+  ui->print(chip);
+}
+// The orange push-to-talk pill at the bottom
+void drawTalkButton(const char *text, bool lit) {
+  int w = strlen(text) * 6 + 28;
+  if (lit) ui->fillRoundRect(120 - w / 2, 214, w, 22, 11, CLAUDE_ORANGE);
+  else ui->drawRoundRect(120 - w / 2, 214, w, 22, 11, CLAUDE_ORANGE);
+  ui->setTextSize(1);
+  ui->setTextColor(lit ? CLAUDE_DARK : CLAUDE_ORANGE);
+  ui->setCursor(120 - strlen(text) * 3, 221);
+  ui->print(text);
+}
+void drawTalkIdle(unsigned long now) {
+  int botY = 76;
+  if (talkMode == 1) { // the language to translate into, changed with UP/DOWN
+    String lang = LANGS[langSel];
+    drawCentered("into", 58, 1, CLAUDE_GRAY);
+    drawCentered(lang, 70, 2, CLAUDE_ORANGE);
+    int half = lang.length() * 6 + 10;
+    ui->fillTriangle(120 - half - 8, 77, 120 - half, 71, 120 - half, 83, CLAUDE_TRACK);
+    ui->fillTriangle(120 + half + 8, 77, 120 + half, 71, 120 + half, 83, CLAUDE_TRACK);
+    botY = 98;
+  }
+  Face face = usage.error.length() ? FACE_WORRIED : FACE_NORMAL;
+  if (now % 3500 < 140) face = FACE_BLINK;
+  int bob = (int)(2 * sinf(now / 600.0f));
+  drawBot(ui, 85, botY + bob, 10, face, 0, 0);
+  int y = botY + 62;
+  if (talkChip.length()) {
+    drawTalkChip(y);
+    y += 20;
+  }
+  bool problem = usage.error.length() > 0;
+  String hint = problem ? usage.error : String(TALK_HINTS[talkMode]);
+  String lines[3];
+  int n = wrapText(hint, 36, lines, min(3, (210 - y) / 11));
+  ui->setTextSize(1);
+  ui->setTextColor(problem ? CLAUDE_AMBER : CLAUDE_GRAY);
+  for (int i = 0; i < n; i++) {
+    ui->setCursor(120 - lines[i].length() * 3, y + i * 11);
+    ui->print(lines[i]);
+  }
+  drawTalkButton("SHUTTER  TO TALK", true);
+}
+void drawTalkListening(unsigned long now) {
+  unsigned long t = now - talkStateAt;
+  drawBot(ui, 85, 66, 10, t % 2600 < 140 ? FACE_BLINK : FACE_HAPPY, 1, 1); // ears up, all attention
+  // sound bars bouncing like a voice meter
+  for (int i = 0; i < 15; i++) {
+    float wave = sinf(t / 90.0f + i * 0.7f) * 0.5f + 0.5f;
+    float swell = sinf(t / 400.0f + i * 0.3f) * 0.5f + 0.5f;
+    int h = 4 + (int)(26 * wave * (0.35f + 0.65f * swell));
+    ui->fillRoundRect(36 + i * 12, 150 - h / 2, 6, h, 3, CLAUDE_ORANGE);
+  }
+  drawCentered("Listening", 176, 2, CLAUDE_CREAM);
+  drawCentered("Talk to your phone", 196, 1, CLAUDE_GRAY);
+  char secs[8];
+  snprintf(secs, sizeof(secs), "%lus", t / 1000);
+  drawTalkButton(secs, false);
+}
+void drawTalkThinking(unsigned long now) {
+  unsigned long t = now - talkStateAt;
+  if (talkHeard.length()) {
+    drawCentered("You said", 58, 1, CLAUDE_GRAY);
+    String lines[2];
+    int n = wrapText("\"" + talkHeard + "\"", 36, lines, 2);
+    for (int i = 0; i < n; i++) drawCentered(lines[i], 72 + i * 11, 1, CLAUDE_CREAM);
+  }
+  float pulse = 1.0f + 0.12f * sinf(t / 180.0f);
+  drawClaudeLogo(ui, 120, 132, 26 * pulse, t * 0.25f, CLAUDE_ORANGE);
+  const char *verb = talkMode == 1 ? "Translating" : talkMode == 2 ? "Saving" : t < 4000 ? "Thinking" : thinkingQuips[(t / 2200) % 6];
+  String label = String(verb);
+  for (int i = 0; i < 3; i++) label += i < (int)((t / 350) % 4) ? '.' : ' ';
+  drawCentered(label, 176, 2, CLAUDE_CREAM);
+  char secs[8];
+  snprintf(secs, sizeof(secs), "%lus", t / 1000);
+  drawTalkButton(secs, false);
+}
+void drawTalkAnswer() {
+  int top = 56;
+  if (talkHeard.length()) {
+    String line = "> " + talkHeard;
+    if (line.length() > 38) line = line.substring(0, 37) + ".";
+    ui->setTextSize(1);
+    ui->setTextColor(CLAUDE_GRAY);
+    ui->setCursor(8, top);
+    ui->print(line);
+    top += 14;
+  }
+  int bottom = talkChip.length() ? 190 : 208;
+  drawBubble(ui, 6, top, 228, bottom - top, 20, top - 6);
+  int lineH = talkTextSize == 2 ? 18 : 11;
+  int visible = (bottom - top - 10) / lineH;
+  ui->setTextSize(talkTextSize);
+  ui->setTextColor(talkFailed ? CLAUDE_RED : CLAUDE_DARK);
+  int budget = talkReveal;
+  for (int i = talkScroll; i < talkLineCount && i < talkScroll + visible && budget > 0; i++) {
+    ui->setCursor(16, top + 8 + (i - talkScroll) * lineH);
+    String &line = talkLines[i];
+    ui->print(budget >= (int)line.length() ? line : line.substring(0, budget));
+    budget -= line.length();
+  }
+  if (talkScroll > 0) ui->fillTriangle(222, top + 6, 216, top + 14, 228, top + 14, CLAUDE_ORANGE);
+  if (talkScroll + visible < talkLineCount) ui->fillTriangle(222, bottom - 6, 216, bottom - 14, 228, bottom - 14, CLAUDE_ORANGE);
+  drawTalkChip(194);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(6, 228);
+  ui->print(talkScroll + visible < talkLineCount || talkScroll > 0 ? "^v more" : "");
+  ui->setCursor(150, 228);
+  ui->print("Shutter: talk");
+}
+void talkScreen() {
+  bool waiting = talkState == TALK_LISTENING || talkState == TALK_THINKING;
+  int lineH = talkTextSize == 2 ? 18 : 11;
+  int visible = ((talkChip.length() ? 190 : 208) - (talkHeard.length() ? 70 : 56) - 10) / lineH;
+  if (!waiting) {
+    if (pycamera.justPressed(SHUTTER_BUTTON) || pycamera.justPressed(AWEXP_BUTTON_OK)) {
+      startTalk();
+      return;
+    }
+    if (pycamera.justPressed(AWEXP_BUTTON_LEFT) || pycamera.justPressed(AWEXP_BUTTON_RIGHT)) {
+      talkMode = (talkMode + (pycamera.justPressed(AWEXP_BUTTON_LEFT) ? TALK_MODES - 1 : 1)) % TALK_MODES;
+      talkChip = "";
+      setTalkState(TALK_IDLE);
+      pycamera.speaker_tone(1200, 15);
+    }
+    bool up = pycamera.justPressed(AWEXP_BUTTON_UP), down = pycamera.justPressed(AWEXP_BUTTON_DOWN);
+    if (talkState == TALK_ANSWER && (up || down)) {
+      if (down && talkScroll + visible < talkLineCount) talkScroll++;
+      if (up && talkScroll > 0) talkScroll--;
+      talkReveal = 9999;
+    } else if (talkState == TALK_IDLE && talkMode == 1 && (up || down)) {
+      langSel = (langSel + (up ? LANG_COUNT - 1 : 1)) % LANG_COUNT;
+      prefs.putUChar("lang", langSel);
+    }
+  }
+  static unsigned long lastDraw = 0;
+  unsigned long now = millis();
+  if (now - lastDraw < 33) return; // ~30 fps for the voice bars
+  lastDraw = now;
+  if (talkState == TALK_ANSWER && talkReveal < 9999) { // typewriter: ~4 characters per frame
+    int total = 0;
+    for (int i = 0; i < talkLineCount; i++) total += talkLines[i].length();
+    talkReveal = talkReveal + 4 >= total ? 9999 : talkReveal + 4;
+  }
+  drawTalkHeader();
+  switch (talkState) {
+    case TALK_IDLE: drawTalkIdle(now); break;
+    case TALK_LISTENING: drawTalkListening(now); break;
+    case TALK_THINKING: drawTalkThinking(now); break;
+    case TALK_ANSWER: drawTalkAnswer(); break;
+  }
+  pushUi();
+}
+
 // ===================== IDLE CLOCK =====================
 // After a while with no button presses the screen dims and the bot dozes off under
 // a clock. Any button wakes it back to whatever you were doing.
@@ -3856,6 +4319,8 @@ bool canSleepNow() {
       return false;
     case MODE_ASK:
       return askState != ASK_THINKING;
+    case MODE_TALK:
+      return talkState == TALK_IDLE || talkState == TALK_ANSWER;
     case MODE_GAME:           // Tilt Catch is played without buttons
       return !(currentGame == GAME_TILT && !gameOver);
     case MODE_TOOL:           // hands-free tools, a running timer, or a recording
@@ -3928,12 +4393,13 @@ void drawSleepScreen() {
     ui->setCursor(bx + 7 * U + 4 + (int)(p * 40), by - 16 - (int)(p * 24)); // drift right, clear of the date
     ui->print(p < 0.5f ? 'z' : 'Z');
   }
-  // Quick usage peek, then how to wake up
+  // Quick peek at the phone link, then how to wake up
   ui->setTextSize(1);
   ui->setTextColor(CLAUDE_GRAY);
-  if (usage.valid) {
-    char peek[40];
-    snprintf(peek, sizeof(peek), "Session %d%%   Weekly %d%%", (int)(usage.sessionPct + 0.5f), (int)(usage.weeklyPct + 0.5f));
+  if (phoneOnline()) {
+    char peek[44];
+    if (usage.battery >= 0) snprintf(peek, sizeof(peek), "Phone %d%%   %lu Claude asks today", usage.battery, usage.requests);
+    else snprintf(peek, sizeof(peek), "%lu Claude asks today", usage.requests);
     ui->setCursor(120 - strlen(peek) * 3, 210);
     ui->print(peek);
   }
@@ -3973,6 +4439,9 @@ void setup() {
     while (1) yield();
   }
   prefs.begin("clawd", false);
+  langSel = prefs.getUChar("lang", 1) % LANG_COUNT; // Hindi until you pick another
+  if (!bridgeUrl.length()) bridgeUrl = prefs.getString("bridge", "");   // where the phone was last time
+  if (!bridgeToken.length()) bridgeToken = prefs.getString("token", ""); // paired before
   calibrateAccel();
   loadAlarms();
   loadBestScores();
@@ -4037,9 +4506,9 @@ void setup() {
   xTaskCreatePinnedToCore(netTask, "net", 12288, NULL, 1, &netTaskHandle, 0); // HTTPS needs the bigger stack
   // The dance music has its own task so the beat stays steady while the screen redraws
   xTaskCreatePinnedToCore(danceTask, "dance", 4096, NULL, 2, &danceTaskHandle, 0);
-  // Give the quote a few seconds on screen, then always start on the Claude usage screen
+  // Give the quote a few seconds on screen, then start on Clawd Talk, ready for a question
   while (millis() - quoteShownAt < 4000) delay(10);
-  currentMode = MODE_USAGE;
+  openTalk();
   lastActivity = millis();
 }
 void loop() {
@@ -4059,20 +4528,24 @@ void loop() {
   checkAlarms();
   pomoTick();
   petTick();
+  talkTick();
   webTick();
   static unsigned long lastEventCheck = 0;
   if (millis() - lastEventCheck > 1000) { // Telegram reminders, in every mode
     lastEventCheck = millis();
     checkScheduledEvents();
   }
-  // Find out where we are once, for weather and planes
-  if (!locationKnown && !locateTried && !netBusy() && WiFi.status() == WL_CONNECTED && currentMode != MODE_ASK) {
+  // Keep track of where we are (phone GPS, else IP), for weather, planes and the ISS
+  if (currentMode != MODE_ASK && currentMode != MODE_TALK && locationDue()) {
     locateTried = true;
     requestWidget(W_LOCATE);
   }
-  // Keep usage fresh in the background (paused in Ask so questions aren't delayed, and in Dance)
-  if (currentMode != MODE_ASK && currentMode != MODE_DANCE && currentMode != MODE_ALARM_RING && !netBusy() && (lastUsagePoll == 0 || millis() - lastUsagePoll > USAGE_POLL_MS)) {
-    requestUsage(false);
+  // Check in with the phone every minute: usage, battery, and actions said into the phone app
+  // (paused while Ask or Talk is waiting on Claude so questions aren't delayed, and in Dance)
+  bool talkBusy = currentMode == MODE_TALK && talkState != TALK_IDLE && talkState != TALK_ANSWER;
+  if (currentMode != MODE_ASK && !talkBusy && currentMode != MODE_DANCE && currentMode != MODE_ALARM_RING && !netBusy() &&
+      (lastUsagePoll == 0 || millis() - lastUsagePoll > (phoneOnline() ? USAGE_POLL_MS : 10000UL))) { // look harder while lost
+    requestUsage();
   }
   if (pycamera.justPressed(AWEXP_BUTTON_SEL)) {
     if (currentMode != MODE_MENU) {
@@ -4121,6 +4594,9 @@ void loop() {
       break;
     case MODE_USAGE:
       usageMode();
+      break;
+    case MODE_TALK:
+      talkScreen();
       break;
     case MODE_ASK:
       askMode();
@@ -4178,17 +4654,18 @@ void handleMenuNavigation() {
   }
   if (pycamera.justPressed(AWEXP_BUTTON_OK)) {
     switch (menuSelection) {
-      case 0: currentMode = MODE_USAGE; break;
+      case 0: openTalk(); break;
       case 1: currentMode = MODE_ASK; break;
-      case 2: currentMode = MODE_DANCE; startDance(0); petBoost(5); break;
-      case 3: currentMode = MODE_PET; break;
-      case 4: currentMode = MODE_ALARMS; alarmField = -1; break;
-      case 5: currentMode = MODE_FACE; break;
-      case 6: currentMode = MODE_WORLD; break;
-      case 7: currentMode = MODE_GAME_MENU; break;
-      case 8: currentMode = MODE_TOOLS; break;
-      case 9: currentMode = MODE_CAMERA; break;
-      case 10: currentMode = MODE_HOME_ASSISTANT; break;
+      case 2: currentMode = MODE_USAGE; break;
+      case 3: currentMode = MODE_DANCE; startDance(0); petBoost(5); break;
+      case 4: currentMode = MODE_PET; break;
+      case 5: currentMode = MODE_ALARMS; alarmField = -1; break;
+      case 6: currentMode = MODE_FACE; break;
+      case 7: currentMode = MODE_WORLD; break;
+      case 8: currentMode = MODE_GAME_MENU; break;
+      case 9: currentMode = MODE_TOOLS; break;
+      case 10: currentMode = MODE_CAMERA; break;
+      case 11: currentMode = MODE_HOME_ASSISTANT; break;
     }
   }
 }

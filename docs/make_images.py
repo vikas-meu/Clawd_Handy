@@ -262,27 +262,50 @@ def dance_gif():
 
 
 # ---------------------------------------------------------------- screens.png
-def usage_screen():
+def talk_header(s, mode=0):
+    """Top of Clawd Talk, as drawTalkHeader(): spark, name, phone battery, mode tabs."""
+    logo(s, 14, 14, 9, 0, ORANGE)
+    s.text(30, 7, "Clawd", 2, CREAM)
+    s.rrect(192, 8, 7, 12, 2, CREAM, outline=True)  # phone battery chip
+    s.rect(194, 11, 3, 7, CREAM)
+    s.text(202, 11, "82%", 1, CREAM)
+    for i, name in enumerate(("Ask", "Translate", "Note")):
+        x = 6 + i * 77
+        if i == mode:
+            s.rrect(x, 30, 74, 20, 10, ORANGE)
+        else:
+            s.rrect(x, 30, 74, 20, 10, TRACK, outline=True)
+        s.text(x + 37 - len(name) * 3, 36, name, 1, DARK if i == mode else GRAY)
+
+
+def talk_screen():
     s = Screen()
-    logo(s, 20, 18, 11, 0, ORANGE)
-    s.text(38, 11, "Claude Usage", 2, CREAM)
-    s.rrect(200, 11, 26, 15, 4, ORANGE, outline=True)
-    s.text(204, 15, "PRO", 1, ORANGE)
-    for y, label, span, pct, reset in ((42, "Session", "(5hr)", 14, "3h 32m"), (102, "Weekly", "(7 day)", 2, "6d 20h")):
-        s.text(12, y, label, 2, CREAM)
-        s.text(12 + len(label) * 12 + 4, y + 6, span, 1, GRAY)
-        p = f"{pct}%"
-        s.text(228 - len(p) * 12, y, p, 2, ORANGE)
-        s.rrect(12, y + 22, 216, 12, 6, TRACK)
-        s.rrect(12, y + 22, max(12, 216 * pct // 100), 12, 6, ORANGE)
-        s.text(12, y + 40, "Resets in " + reset, 1, GRAY)
-    bot(s, 20, 180, 6, "happy", 2)
-    bubble(s, 76, 164, 156, 46, 66, 192)
-    s.text(85, 171, "Plenty of room. Let's", 1, DARK)
-    s.text(85, 183, "build something!", 1, DARK)
-    s.circle(10, 229, 3, GREEN)
-    s.text(18, 226, "Updated 12s ago", 1, GRAY)
-    s.text(128, 226, "<> page  OK reload", 1, GRAY)
+    talk_header(s)
+    s.text(8, 56, "> wake me at 7 and will it rain", 1, GRAY)
+    bubble(s, 6, 70, 228, 120, 20, 64)
+    for i, line in enumerate(("Alarm set for 7.", "No rain tomorrow:", "sunny, 31C high,", "light breeze.")):
+        s.text(16, 78 + i * 18, line, 2, DARK)
+    chip = "Alarm 7:00 AM"
+    w = len(chip) * 6 + 16
+    s.rrect(120 - w // 2, 194, w, 15, 7, ORANGE)
+    s.text(120 - w // 2 + 8, 198, chip, 1, DARK)
+    s.text(150, 228, "Shutter: talk", 1, GRAY)
+    return s
+
+
+def listening_screen():
+    s = Screen()
+    talk_header(s, 1)
+    bot(s, 85, 66, 10, "happy", 1, 1)
+    for i in range(15):  # the voice meter in drawTalkListening()
+        wave = math.sin(1.9 + i * 0.7) * 0.5 + 0.5
+        swell = math.sin(0.8 + i * 0.3) * 0.5 + 0.5
+        h = 4 + int(26 * wave * (0.35 + 0.65 * swell))
+        s.rrect(36 + i * 12, 150 - h // 2, 6, h, 3, ORANGE)
+    s.centered("Listening", 176, 2, CREAM)
+    s.centered("Talk to your phone", 196, 1, GRAY)
+    s.rrect(120 - 20, 214, 40, 22, 11, ORANGE, outline=True)
+    s.centered("2s", 221, 1, ORANGE)
     return s
 
 
@@ -298,7 +321,7 @@ def clock_screen():
     s.circle(bx + 6 * U, by - 2 * U, U // 2, CREAM)
     for i, p in enumerate((0.1, 0.45, 0.8)):  # same drift as drawSleepScreen()
         s.text(bx + 7 * U + 4 + int(p * 40), by - 16 - int(p * 24), "zzZ"[i], 1 + int(p * 3), CREAM)
-    s.centered("Session 14%   Weekly 2%", 210, 1, GRAY)
+    s.centered("Phone 82%   12 Claude asks today", 210, 1, GRAY)
     s.circle(92, 229, 4, ORANGE)
     s.rect(88, 229, 9, 3, ORANGE)
     s.text(102, 226, "8:00 AM", 1, ORANGE)
@@ -343,28 +366,11 @@ def pet_screen():
     return s
 
 
-def pomodoro_screen():
-    s = Screen()
-    done = 0.38
-    for a in range(0, 360, 4):
-        r = math.radians(a)
-        s.circle(120 + math.sin(r) * 80, 104 - math.cos(r) * 80, 4, ORANGE if a < done * 360 else TRACK)
-    s.centered("FOCUS", 50, 2, ORANGE)
-    s.centered("15:30", 72, 4, CREAM)
-    bot(s, 103, 120, 5, "normal", 1, 0)
-    for i in range(3):
-        x = 120 - 27 + 9 + i * 18
-        s.circle(x, 200, 6, RED)
-        s.rect(x - 1, 192, 3, 3, GREEN)
-    s.centered("OK pause   < reset   UP/DN 25 min", 226, 1, GRAY)
-    return s
-
-
 def menu_screen():
     s = Screen()
     logo(s, 20, 18, 11, 0, ORANGE)
     s.text(38, 11, "Menu", 2, CREAM)
-    items = ["Claude Usage", "Claude Ask", "Claude Dance", "Clawd Pet", "Alarms", "Face Finder"]
+    items = ["Clawd Talk", "Claude Ask", "API Status", "Claude Dance", "Clawd Pet", "Alarms"]
     for i, name in enumerate(items):
         y = 40 + i * 30
         if i == 2:
@@ -378,8 +384,8 @@ def menu_screen():
 
 
 def screens_png():
-    shots = [("Menu", menu_screen()), ("Claude usage", usage_screen()), ("Clawd Pet", pet_screen()),
-             ("Pomodoro", pomodoro_screen()), ("Idle clock", clock_screen()), ("Alarm!", alarm_screen())]
+    shots = [("Clawd Talk", talk_screen()), ("Listening", listening_screen()), ("Menu", menu_screen()),
+             ("Clawd Pet", pet_screen()), ("Idle clock", clock_screen()), ("Alarm!", alarm_screen())]
     pad, cap, size = 24, 34, 240 * SCALE
     sheet = Image.new("RGB", (3 * size + 4 * pad, 2 * (size + cap) + 3 * pad), (13, 17, 23))
     d = ImageDraw.Draw(sheet)

@@ -1,2 +1,0 @@
-anthropic>=1.0
-opencv-python-headless<5

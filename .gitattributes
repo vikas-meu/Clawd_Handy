@@ -1,0 +1,2 @@
+# Private values in the sketch are swapped for placeholders on commit: see tools/private_values.py
+claude_desk_buddy/claude_desk_buddy.ino filter=private-values
