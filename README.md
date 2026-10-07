@@ -13,6 +13,11 @@ Press the shutter and talk: it answers, searches the web, translates, sets your 
 
 <p align="center"><img src="docs/screens.png" alt="Six screens: Clawd Talk answer, listening, menu, Clawd Pet, idle clock, alarm"></p>
 
+## What's new in 2.1
+
+- **Daily Feed**, a new menu: your **YouTube subscriber count** (with confetti when it goes up), crypto, exchange rates, Hacker News, on this day in history, a random Wikipedia article, a trivia quiz and a joke.
+- **World Live** grows to 8 pages: **air quality**, **sun & moon** (sunrise arc, moon phase), **space weather** (aurora chances) and the **next rocket launches** with a live countdown.
+
 ## What's new in 2.0
 
 - **Your phone replaces the PC.** The Python bridge is gone. The Clawd Phone Android app now does the listening, Claude calls, GPS, faces and QR codes, and the board works anywhere your phone goes, including on the phone's own hotspot.
@@ -33,7 +38,8 @@ Press the shutter and talk: it answers, searches the web, translates, sets your 
 | 🐣 | **Clawd Pet** | A Tamagotchi: feed, play, tickle, nap. Food, energy and fun drop over time, even while the board is off. |
 | ⏰ | **Alarms** | Four alarms, set with the buttons or by voice (once / daily / weekdays / weekends). They ring with a funk tune and a dancing Clawd. Shake or press any key to snooze. |
 | 🙂 | **Face Finder** | Live camera with boxes around faces. Clawd follows the first face with its eyes and waves at newcomers. |
-| 🌍 | **World Live** | Weather from your phone's GPS (it follows you around), planes overhead on a radar, the ISS on a world map, recent earthquakes, and crypto prices. |
+| 🌍 | **World Live** | Location and space, 8 pages: weather from your phone's GPS (it follows you around), air quality, sunrise/sunset and tonight's moon, planes overhead on a radar, the ISS on a world map, space weather and aurora chances, the next rocket launches with a countdown, and recent earthquakes. |
+| 📰 | **Daily Feed** | 8 pages: your YouTube channel's subscribers, views and videos (confetti when they go up), crypto prices, exchange rates in your currency, the Hacker News front page, a slice of history from today's date, a random Wikipedia article, a trivia quiz that keeps score, and a joke with a punchline on OK. |
 | 🎮 | **Games** | Flappy Clawd, Block Drop, 2048, and Tilt Catch (steered with the accelerometer). Best scores are saved. |
 | 🧰 | **Toolbox** | Pomodoro timer, spirit level, 3-2-1 photo booth, timelapse with flipbook playback, QR scanner, smart-home buttons, and a web remote. |
 | 🌙 | **Idle clock** | After 40 s without a button press the screen dims to a clock with Clawd asleep in a nightcap, plus your next alarm and the phone's battery. |
@@ -193,7 +199,7 @@ Once the board knows the time, it keeps counting on its own. The time is also sa
 | Pet | **OK** feed · **▶** play · **▲** tickle · **▼** nap / wake |
 | Alarms | **▲▼** pick · **OK** edit · **▶** on/off. While editing: **◀ ▶** field, **▲▼** change (hold to scroll), **OK** save |
 | Alarm ringing | **OK** stop · any other key or a **shake** snoozes 5 min |
-| World Live | **◀ ▶** page · **OK** refresh |
+| World Live / Daily Feed | **◀ ▶** page · **OK** refresh. Trivia: **▲▼** pick, **OK** answer, **OK** next · Joke: **OK** punchline, **OK** next · On this day: **▲▼** more events · Wikipedia: **▲▼** scroll, **OK** another |
 | Games | Flappy: **OK** flap · Blocks: **◀ ▶** move, **▲** turn, **▼** faster, **Shutter** drop · 2048: D-pad · Tilt Catch: tilt the board |
 
 ## Settings worth knowing
@@ -207,6 +213,8 @@ Once the board knows the time, it keeps counting on its own. The time is also sa
 | `LANGS[]` in the sketch | 15 languages | The Translate choices on the board |
 | `TILT_FLIP_X`, `TILT_FLIP_Y` | `false` | Flip if Tilt Catch moves the wrong way |
 | `SONGS[]` | 3 songs | Add your own: one drum bar plus bass and chord patterns over 4 chords |
+| `YT_HANDLE`, `YT_API_KEY` in YOUR SETTINGS | placeholders | Your channel (e.g. `@vikas`) and a free YouTube Data API key, for the YouTube page |
+| `HOME_CURRENCY` in YOUR SETTINGS | `INR` | The currency the exchange rates are shown in |
 | `MODEL` in `Brain.kt` | `claude-opus-5-5` | The Claude model the phone uses (at low effort, for quick answers) |
 | Phone app, Setup card | on | Speak answers out loud on the phone |
 
@@ -219,7 +227,8 @@ Once the board knows the time, it keeps counting on its own. The time is also sa
 - **Listening fails when the phone is locked:** some phones' speech recognizers only work with the screen on. Keep the phone unlocked, or open the app once.
 - **Weather shows the wrong town:** allow location in the app and tap **Update now**. The API Status phone page shows whether the board is using **Phone GPS** or an **Internet (IP guess)**.
 - **Talk or Ask says to add an API key:** add it in the app's Setup card. API use is billed separately from a Claude plan.
-- **Planes page says "Too many requests":** OpenSky allows about 400 anonymous requests a day. The page only refreshes while it's on screen.
+- **Planes page says "Too many requests":** OpenSky allows about 400 anonymous requests a day. The page only refreshes while it's on screen. Launches have a similar limit (15 an hour), so that page refreshes every 30 minutes.
+- **YouTube page says to add a key:** in [Google Cloud Console](https://console.cloud.google.com), create a project, enable **YouTube Data API v3**, and under **Credentials** create an API key. Put it in `YT_API_KEY` and your handle in `YT_HANDLE`. It's free; the board uses about 300 of the 10,000 daily quota units. YouTube rounds counts above 1,000 to three significant figures, so the number moves in steps.
 - **Stuck on boot without an SD card:** the original sketch waits for an SD card. Insert one.
 - **Building it yourself:** don't add the ESP32 `WebServer` library. It pulls in `FS.h`, which makes SdFat stop defining `File` and breaks the camera library's `takePhoto()`. The web remote uses a tiny server built on `WiFiServer` instead.
 

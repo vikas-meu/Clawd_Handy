@@ -49,6 +49,12 @@ struct Alarm { bool on; uint8_t hour, minute, repeat; };
 // Only fill these in if automatic finding or pairing doesn't work for you.
 #define BRIDGE_URL "" // private  e.g. "http://192.168.1.42:8765"
 #define BRIDGE_TOKEN "" // private  the pairing token shown in the app
+// Daily Feed > YouTube: your channel's handle, and a free YouTube Data API v3 key from
+// console.cloud.google.com (APIs & Services > Library > YouTube Data API v3 > Credentials)
+#define YT_HANDLE "@yourchannel" // private
+#define YT_API_KEY "your-youtube-api-key" // private
+// Daily Feed > Currency: rates are shown in this currency
+#define HOME_CURRENCY "INR"
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
 // Pin definitions
@@ -123,7 +129,7 @@ enum Mode {
 Mode currentMode = MODE_IDLE;
 int menuSelection = 0;
 const char* menuOptions[] = {"Clawd Talk", "Claude Ask", "API Status", "Claude Dance", "Clawd Pet", "Alarms",
-                             "Face Finder", "World Live", "Games", "Toolbox", "Camera Mode", "Home Assistant"};
+                             "Face Finder", "World Live", "Daily Feed", "Games", "Toolbox", "Camera Mode", "Home Assistant"};
 int numMenuOptions = sizeof(menuOptions) / sizeof(menuOptions[0]);
 // Function prototypes
 void drawMenu();
@@ -488,6 +494,7 @@ int webRequest() {
   http.setConnectTimeout(8000);
   http.setTimeout(15000);
   http.setUserAgent("ClaudeDeskBuddy/1.0");
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); // Wikipedia's random article is a redirect
   int status = -1;
   if (http.begin(tls, netPath)) {
     status = http.GET();
@@ -1689,9 +1696,13 @@ void faceMode() {
   pycamera.blitFrame();
 }
 
-// ===================== WORLD LIVE =====================
-// Free web data the board fetches itself over WiFi, no API keys: Open-Meteo (weather),
-// OpenSky (planes), wheretheiss.at (ISS), USGS (earthquakes) and CoinGecko (crypto).
+// ===================== WORLD LIVE + DAILY FEED =====================
+// Free web data the board fetches itself over WiFi, no API keys (except YouTube's free one):
+//   World Live: Open-Meteo (weather, air quality, sunrise), OpenSky (planes), wheretheiss.at
+//               (ISS), NOAA SWPC (space weather), The Space Devs (rocket launches), USGS (quakes)
+//   Daily Feed: YouTube Data API (your subscribers), CoinGecko (crypto), Frankfurter (ECB
+//               exchange rates), Hacker News (Algolia), byabbe.se (on this day), Wikipedia,
+//               Open Trivia DB and JokeAPI
 // Your location comes from the phone's GPS (or, without the phone, a guess from your internet
 // connection via ipwho.is) unless you pin it here.
 #define MY_LAT 0.0f // e.g. 23.2599 to pin your location; 0 = automatic
@@ -1701,16 +1712,45 @@ void faceMode() {
 #define W_ISS 2
 #define W_QUAKES 3
 #define W_CRYPTO 4
-#define W_PAGES 5
-#define W_LOCATE 5 // not a page: the one-off location lookup
+#define W_AIR 5
+#define W_SKY 6
+#define W_SPACEWX 7
+#define W_LAUNCH 8
+#define W_YOUTUBE 9
+#define W_FX 10
+#define W_NEWS 11
+#define W_HISTORY 12
+#define W_WIKI 13
+#define W_TRIVIA 14
+#define W_JOKE 15
+#define W_PAGES 16
+#define W_LOCATE 16 // not a page: the location lookup
 #define CLAUDE_LAND 0x3A67  // #384E3C
 #define CLAUDE_CLOUD 0xCE59 // #C8C8CC
-const char *W_TITLES[] = {"Weather", "Planes nearby", "ISS tracker", "Earthquakes", "Crypto"};
-const unsigned long W_REFRESH_MS[] = {900000, 60000, 10000, 600000, 120000, 0};
+const char *W_TITLES[] = {"Weather", "Planes nearby", "ISS tracker", "Earthquakes", "Crypto",
+                          "Air quality", "Sun & Moon", "Space weather", "Launches", "YouTube",
+                          "Currency", "Hacker News", "On this day", "Wikipedia", "Trivia", "Joke"};
+#define MIN_MS 60000UL
+// How often each page refreshes while it's on screen (the last six also refresh on OK)
+const unsigned long W_REFRESH_MS[] = {15 * MIN_MS, MIN_MS, 10000, 10 * MIN_MS, 2 * MIN_MS,
+                                      30 * MIN_MS, 360 * MIN_MS, 30 * MIN_MS, 30 * MIN_MS, 5 * MIN_MS,
+                                      360 * MIN_MS, 15 * MIN_MS, 360 * MIN_MS, 360 * MIN_MS, 360 * MIN_MS, 360 * MIN_MS, 0};
+// The two menus share these pages
+const uint8_t WORLD_SET[] = {W_WEATHER, W_AIR, W_SKY, W_PLANES, W_ISS, W_SPACEWX, W_LAUNCH, W_QUAKES};
+const uint8_t FEED_SET[] = {W_YOUTUBE, W_CRYPTO, W_FX, W_NEWS, W_HISTORY, W_WIKI, W_TRIVIA, W_JOKE};
+bool feedMode = false;      // MODE_WORLD is showing Daily Feed instead of World Live
+int worldIdx = 0, feedIdx = 0;
 unsigned long wFetchedAt[W_PAGES + 1];
 bool wHasData[W_PAGES + 1];
 String wError[W_PAGES + 1];
 int worldPage = 0;
+bool needsLocation(int w) {
+  return w == W_WEATHER || w == W_PLANES || w == W_AIR || w == W_SKY;
+}
+String feedUrl(int w);
+void feedFilter(int w, JsonDocument &filter);
+bool parseFeed(int w, JsonDocument &doc);
+bool pageReady(int w);
 int webWidget = -1; // which widget the running web request is for
 float myLat = MY_LAT, myLon = MY_LON;
 String myCity;
@@ -1852,8 +1892,10 @@ String widgetUrl(int w) {
       return "https://api.wheretheiss.at/v1/satellites/25544";
     case W_QUAKES:
       return "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson";
-    default:
+    case W_CRYPTO:
       return "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,dogecoin&vs_currencies=inr&include_24hr_change=true";
+    default:
+      return feedUrl(w);
   }
 }
 void requestWidget(int w) {
@@ -1874,7 +1916,8 @@ void worldTick() {
     requestWidget(W_LOCATE);
     return;
   }
-  if ((w == W_WEATHER || w == W_PLANES) && !locationKnown) return;
+  if (needsLocation(w) && !locationKnown) return;
+  if (!pageReady(w)) return; // e.g. YouTube without a key
   if (!wFetchedAt[w] || millis() - wFetchedAt[w] > W_REFRESH_MS[w]) requestWidget(w);
 }
 void handleWebResult(int status, const String &body) {
@@ -1883,9 +1926,10 @@ void handleWebResult(int status, const String &body) {
   if (w < 0) return;
   if (w == W_LOCATE) locatedAt = millis();
   if (status != 200) {
-    wError[w] = status == 429 ? String("Too many requests - try later")
-              : status < 0    ? String("No internet connection")
-                              : "Server error " + String(status);
+    wError[w] = status == 429                                  ? String("Too many requests - try later")
+              : status < 0                                     ? String("No internet connection")
+              : w == W_YOUTUBE && (status == 400 || status == 403) ? String("YouTube refused the API key (YT_API_KEY)")
+                                                               : "Server error " + String(status);
     if (w != W_LOCATE) wFetchedAt[w] = millis() - W_REFRESH_MS[w] + 20000; // retry in 20 s
     return;
   }
@@ -1898,6 +1942,10 @@ void handleWebResult(int status, const String &body) {
     filter["features"][0]["properties"]["time"] = true;
     filter["features"][0]["geometry"]["coordinates"] = true;
     err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  } else if (w >= W_AIR && w != W_LOCATE) { // the newer pages keep only what they show
+    JsonDocument filter;
+    feedFilter(w, filter);
+    err = filter.isNull() ? deserializeJson(doc, body) : deserializeJson(doc, body, DeserializationOption::Filter(filter));
   } else {
     err = deserializeJson(doc, body);
   }
@@ -1911,8 +1959,8 @@ void handleWebResult(int status, const String &body) {
       if (doc["success"] | false) {
         float lat = doc["latitude"] | 0.0f, lon = doc["longitude"] | 0.0f;
         if (locationKnown && distanceKm(myLat, myLon, lat, lon) > 3) { // moved: refresh what depends on it
-          wFetchedAt[W_WEATHER] = 0;
-          wFetchedAt[W_PLANES] = 0;
+          for (int i = 0; i < W_PAGES; i++)
+            if (needsLocation(i)) wFetchedAt[i] = 0;
           planeCount = 0;
         }
         myLat = lat;
@@ -2009,6 +2057,9 @@ void handleWebResult(int status, const String &body) {
         coinHist[c][coinHistLen] = coinPrice[c];
       }
       coinHistLen++;
+      break;
+    default:
+      if (!parseFeed(w, doc)) return; // parseFeed set wError
       break;
   }
   wHasData[w] = true;
@@ -2276,10 +2327,721 @@ void drawCrypto() {
     ui->print(chg);
   }
 }
+// ---- the newer pages: air quality, sun & moon, space weather, launches, and the Daily Feed ----
+// Text from the web can hold accents and curly quotes; the screen font is plain ASCII
+String asciiFold(const String &in) {
+  static const char *LATIN1 = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPsaaaaaaaceeeeiiiidnooooo/ouuuuypy"; // U+00C0..U+00FF
+  String out;
+  out.reserve(in.length());
+  for (unsigned i = 0; i < in.length(); i++) {
+    uint8_t c = in[i];
+    if (c < 0x80) {
+      out += (char)c;
+    } else if (c == 0xC3 && i + 1 < in.length()) { // Latin-1 letters: drop the accent
+      uint8_t d = in[++i];
+      if (d >= 0x80 && d <= 0xBF) out += LATIN1[d - 0x80];
+    } else if (c == 0xE2 && i + 2 < in.length() && (uint8_t)in[i + 1] == 0x80) { // punctuation
+      uint8_t d = in[i + 2];
+      i += 2;
+      if (d == 0x98 || d == 0x99) out += '\'';
+      else if (d == 0x9C || d == 0x9D) out += '"';
+      else if (d == 0x93 || d == 0x94) out += '-';
+      else if (d == 0xA6) out += "...";
+      else if (d == 0xA2) out += '*';
+    } else if (c >= 0xC0) { // any other character: skip all its bytes
+      int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
+      i += extra;
+    }
+  }
+  return out;
+}
+// Open Trivia DB sends %-encoded text (no HTML entities to untangle)
+String urlDecode(const char *s) {
+  String out;
+  for (; *s; s++) {
+    if (*s == '%' && isxdigit(s[1]) && isxdigit(s[2])) {
+      char hex[3] = {s[1], s[2], 0};
+      out += (char)strtol(hex, NULL, 16);
+      s += 2;
+    } else {
+      out += *s;
+    }
+  }
+  return out;
+}
+// "2026-10-06T08:17:44Z" -> seconds since 1970 (UTC), without needing the TZ setting
+int64_t isoToEpoch(const char *s) {
+  int Y, M, D, h = 0, m = 0, sec = 0;
+  if (sscanf(s, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) < 3) return 0;
+  Y -= M <= 2;
+  int64_t era = (Y >= 0 ? Y : Y - 399) / 400;
+  int yoe = Y - era * 400;
+  int doy = (153 * (M + (M > 2 ? -3 : 9)) + 2) / 5 + D - 1;
+  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (era * 146097 + doe - 719468) * 86400LL + h * 3600 + m * 60 + sec;
+}
+// Draws word-wrapped text; returns the y below it
+int drawWrapped(const String &text, int x, int y, int size, uint16_t color, int maxLines, int skip) {
+  String lines[30];
+  int perLine = (236 - x) / (6 * size);
+  int n = wrapText(text, perLine, lines, min(30, skip + maxLines));
+  ui->setTextSize(size);
+  ui->setTextColor(color);
+  for (int i = skip; i < n; i++) {
+    ui->setCursor(x, y);
+    ui->print(lines[i]);
+    y += size * 8 + 3;
+  }
+  return y;
+}
+void drawTile(int x, int y, int w, int h, const char *label, const String &value, uint16_t color) {
+  ui->drawRoundRect(x, y, w, h, 7, CLAUDE_TRACK);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(x + 8, y + 5);
+  ui->print(label);
+  ui->setTextSize(2);
+  ui->setTextColor(color);
+  ui->setCursor(x + 8, y + 17);
+  ui->print(value);
+}
+
+// Air quality
+struct { int aqi; float pm25, pm10, o3, no2; } air;
+// Sun & Moon
+String sunRise, sunSet;
+int sunRiseMin, sunSetMin, dayLenMin;
+float uvMax;
+// Space weather: the planetary K index, every 3 hours
+#define KP_KEEP 24
+float kpHist[KP_KEEP];
+int kpCount = 0;
+// Rocket launches
+struct Launch { String rocket, mission, provider, place, status; int64_t net; };
+#define MAX_LAUNCHES 3
+Launch launches[MAX_LAUNCHES];
+int launchCount = 0;
+// YouTube
+String ytTitle;
+long long ytSubs = -1, ytViews = 0, ytVideos = 0, ytFirstSubs = -1;
+bool ytHidden = false;
+unsigned long ytPartyUntil = 0; // confetti when the count goes up
+// Currency (rates against the US dollar)
+const char *FX_CODES[] = {"USD", "EUR", "GBP", "JPY", "AUD", "CNY", HOME_CURRENCY};
+#define FX_COUNT 6 // the ones shown; the last entry is your home currency
+float fxRate[FX_COUNT + 1];
+String fxDate;
+// Hacker News
+#define MAX_NEWS 6
+String newsTitle[MAX_NEWS];
+int newsPoints[MAX_NEWS], newsComments[MAX_NEWS], newsCount = 0;
+// On this day
+#define MAX_HISTORY 8
+String histYear[MAX_HISTORY], histText[MAX_HISTORY];
+int histCount = 0, histSel = 0;
+// Wikipedia
+String wikiTitle, wikiDesc, wikiText;
+int wikiScroll = 0;
+// Trivia
+String triviaQ, triviaA[4], triviaCat;
+int triviaRight = 0, triviaSel = 0, triviaChosen = -1, triviaScore = 0, triviaAsked = 0;
+// Joke
+String jokeSetup, jokePunch;
+bool jokeShown = false;
+unsigned long jokeShownAt = 0;
+
+bool youtubeConfigured() {
+  return strlen(YT_API_KEY) > 0 && strncmp(YT_API_KEY, "your-", 5) != 0 && strncmp(YT_HANDLE, "@your", 5) != 0;
+}
+// False when a page can't be fetched yet (and says why on screen)
+bool pageReady(int w) {
+  if (w == W_YOUTUBE) return youtubeConfigured();
+  if (w == W_HISTORY) return timeKnown; // needs today's date
+  return true;
+}
+String feedUrl(int w) {
+  char url[320];
+  switch (w) {
+    case W_AIR:
+      snprintf(url, sizeof(url),
+               "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=%.3f&longitude=%.3f"
+               "&current=us_aqi,pm2_5,pm10,ozone,nitrogen_dioxide&timezone=auto",
+               myLat, myLon);
+      return url;
+    case W_SKY:
+      snprintf(url, sizeof(url),
+               "https://api.open-meteo.com/v1/forecast?latitude=%.3f&longitude=%.3f"
+               "&daily=sunrise,sunset,daylight_duration,uv_index_max&timezone=auto&forecast_days=1",
+               myLat, myLon);
+      return url;
+    case W_SPACEWX:
+      return "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json";
+    case W_LAUNCH: // 15 requests an hour without a key, so it refreshes every 30 minutes
+      return "https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=3&mode=list";
+    case W_YOUTUBE: {
+      String handle = YT_HANDLE;
+      handle.replace("@", "%40");
+      return "https://www.googleapis.com/youtube/v3/channels?part=statistics,snippet&forHandle=" + handle +
+             "&fields=items(snippet(title),statistics)&key=" + String(YT_API_KEY);
+    }
+    case W_FX: {
+      String symbols;
+      for (int i = 1; i <= FX_COUNT; i++) {
+        if (symbols.length()) symbols += ",";
+        symbols += FX_CODES[i];
+      }
+      return "https://api.frankfurter.dev/v1/latest?base=USD&symbols=" + symbols;
+    }
+    case W_NEWS:
+      return "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=6"
+             "&attributesToRetrieve=title,points,num_comments&attributesToHighlight=";
+    case W_HISTORY: {
+      struct tm t;
+      if (!localNow(&t)) return "";
+      snprintf(url, sizeof(url), "https://byabbe.se/on-this-day/%d/%d/events.json", t.tm_mon + 1, t.tm_mday);
+      return url;
+    }
+    case W_WIKI:
+      return "https://en.wikipedia.org/api/rest_v1/page/random/summary"; // redirects to a random article
+    case W_TRIVIA:
+      return "https://opentdb.com/api.php?amount=1&type=multiple&encode=url3986";
+    default: // W_JOKE
+      return "https://v2.jokeapi.dev/joke/Programming,Misc,Pun?safe-mode&type=twopart";
+  }
+}
+// Which fields to keep from each reply (some feeds are big)
+void feedFilter(int w, JsonDocument &f) {
+  switch (w) {
+    case W_SPACEWX:
+      f[0]["Kp"] = true;
+      break;
+    case W_LAUNCH:
+      for (const char *k : {"name", "net", "location", "lsp_name"}) f["results"][0][k] = true;
+      f["results"][0]["status"]["abbrev"] = true;
+      break;
+    case W_NEWS:
+      for (const char *k : {"title", "points", "num_comments"}) f["hits"][0][k] = true;
+      break;
+    case W_HISTORY:
+      f["events"][0]["year"] = true;
+      f["events"][0]["description"] = true;
+      break;
+    case W_WIKI:
+      for (const char *k : {"title", "description", "extract"}) f[k] = true;
+      break;
+    default:
+      break; // small replies: keep everything
+  }
+}
+bool parseFeed(int w, JsonDocument &doc) {
+  switch (w) {
+    case W_AIR: {
+      JsonObject c = doc["current"];
+      air.aqi = c["us_aqi"] | -1;
+      air.pm25 = c["pm2_5"] | 0.0f;
+      air.pm10 = c["pm10"] | 0.0f;
+      air.o3 = c["ozone"] | 0.0f;
+      air.no2 = c["nitrogen_dioxide"] | 0.0f;
+      if (air.aqi < 0) return wError[w] = "No air data for here", false;
+      return true;
+    }
+    case W_SKY: {
+      String rise = doc["daily"]["sunrise"][0] | "", set = doc["daily"]["sunset"][0] | "";
+      if (rise.length() < 16 || set.length() < 16) return wError[w] = "No sunrise data", false;
+      sunRise = rise.substring(11, 16);
+      sunSet = set.substring(11, 16);
+      sunRiseMin = sunRise.substring(0, 2).toInt() * 60 + sunRise.substring(3).toInt();
+      sunSetMin = sunSet.substring(0, 2).toInt() * 60 + sunSet.substring(3).toInt();
+      dayLenMin = (int)((doc["daily"]["daylight_duration"][0] | 0.0f) / 60);
+      uvMax = doc["daily"]["uv_index_max"][0] | 0.0f;
+      return true;
+    }
+    case W_SPACEWX: {
+      JsonArray rows = doc.as<JsonArray>();
+      int n = rows.size(), first = max(0, n - KP_KEEP);
+      kpCount = 0;
+      for (int i = first; i < n; i++) kpHist[kpCount++] = rows[i]["Kp"] | 0.0f;
+      if (!kpCount) return wError[w] = "No space weather data", false;
+      return true;
+    }
+    case W_LAUNCH:
+      launchCount = 0;
+      for (JsonObject r : doc["results"].as<JsonArray>()) {
+        if (launchCount >= MAX_LAUNCHES) break;
+        Launch &l = launches[launchCount++];
+        String name = asciiFold(r["name"] | "");
+        int bar = name.indexOf(" | ");
+        l.rocket = bar >= 0 ? name.substring(0, bar) : name;
+        l.mission = bar >= 0 ? name.substring(bar + 3) : name;
+        l.provider = asciiFold(r["lsp_name"] | "");
+        l.place = asciiFold(r["location"] | "");
+        l.status = (const char *)(r["status"]["abbrev"] | "");
+        l.net = isoToEpoch(r["net"] | "");
+      }
+      return true;
+    case W_YOUTUBE: {
+      JsonObject ch = doc["items"][0];
+      if (ch.isNull()) return wError[w] = "No channel " + String(YT_HANDLE) + " - check YT_HANDLE", false;
+      ytTitle = asciiFold(ch["snippet"]["title"] | "");
+      ytHidden = ch["statistics"]["hiddenSubscriberCount"] | false;
+      long long subs = atoll(ch["statistics"]["subscriberCount"] | "0");
+      ytViews = atoll(ch["statistics"]["viewCount"] | "0");
+      ytVideos = atoll(ch["statistics"]["videoCount"] | "0");
+      if (ytSubs >= 0 && subs > ytSubs) { // more subscribers: party!
+        ytPartyUntil = millis() + 6000;
+        if (!danceOn) {
+          const int notes[4] = {1046, 1318, 1568, 2093};
+          for (int i = 0; i < 4; i++) pycamera.speaker_tone(notes[i], 90);
+        }
+      }
+      ytSubs = subs;
+      if (ytFirstSubs < 0) ytFirstSubs = subs;
+      return true;
+    }
+    case W_FX: {
+      fxRate[0] = 1.0f; // everything is against USD
+      for (int i = 1; i <= FX_COUNT; i++) fxRate[i] = doc["rates"][FX_CODES[i]] | 0.0f;
+      fxDate = (const char *)(doc["date"] | "");
+      if (strcmp(HOME_CURRENCY, "USD") != 0 && fxRate[FX_COUNT] <= 0) return wError[w] = "No rate for " HOME_CURRENCY, false;
+      if (strcmp(HOME_CURRENCY, "USD") == 0) fxRate[FX_COUNT] = 1.0f;
+      return true;
+    }
+    case W_NEWS:
+      newsCount = 0;
+      for (JsonObject h : doc["hits"].as<JsonArray>()) {
+        if (newsCount >= MAX_NEWS) break;
+        newsTitle[newsCount] = asciiFold(h["title"] | "");
+        newsPoints[newsCount] = h["points"] | 0;
+        newsComments[newsCount++] = h["num_comments"] | 0;
+      }
+      return true;
+    case W_HISTORY: {
+      JsonArray ev = doc["events"];
+      int n = ev.size();
+      if (!n) return wError[w] = "Nothing for today", false;
+      // a random handful, kept in order through history
+      int pick[MAX_HISTORY], k = 0;
+      for (int i = 0; i < n && k < MAX_HISTORY; i++)
+        if ((int)(esp_random() % (n - i)) < MAX_HISTORY - k) pick[k++] = i;
+      histCount = k;
+      for (int i = 0; i < k; i++) {
+        histYear[i] = (const char *)(ev[pick[i]]["year"] | "");
+        histText[i] = asciiFold(ev[pick[i]]["description"] | "");
+      }
+      histSel = 0;
+      return true;
+    }
+    case W_WIKI:
+      wikiTitle = asciiFold(doc["title"] | "");
+      wikiDesc = asciiFold(doc["description"] | "");
+      wikiText = asciiFold(doc["extract"] | "");
+      wikiScroll = 0;
+      return true;
+    case W_TRIVIA: {
+      JsonObject q = doc["results"][0];
+      if (q.isNull()) return wError[w] = "No question came back", false;
+      triviaQ = asciiFold(urlDecode(q["question"] | ""));
+      triviaCat = asciiFold(urlDecode(q["category"] | "")) + " - " + urlDecode(q["difficulty"] | "");
+      triviaRight = esp_random() % 4; // shuffle the right answer in among the others
+      for (int i = 0, wrong = 0; i < 4; i++)
+        triviaA[i] = asciiFold(urlDecode(i == triviaRight ? (q["correct_answer"] | "") : (q["incorrect_answers"][wrong++] | "")));
+      triviaSel = 0;
+      triviaChosen = -1;
+      return true;
+    }
+    case W_JOKE:
+      if (doc["error"] | true) return wError[w] = "No joke today, sorry", false;
+      jokeSetup = asciiFold(doc["setup"] | "");
+      jokePunch = asciiFold(doc["delivery"] | "");
+      jokeShown = false;
+      return true;
+  }
+  return true;
+}
+
+// ---- drawing the newer pages
+void aqiLevel(int aqi, const char **name, uint16_t *color) {
+  if (aqi <= 50) *name = "Good", *color = CLAUDE_GREEN;
+  else if (aqi <= 100) *name = "Moderate", *color = CLAUDE_AMBER;
+  else if (aqi <= 150) *name = "Unhealthy for some", *color = CLAUDE_ORANGE;
+  else if (aqi <= 200) *name = "Unhealthy", *color = CLAUDE_RED;
+  else if (aqi <= 300) *name = "Very unhealthy", *color = 0x881F;
+  else *name = "Hazardous", *color = 0x8000;
+}
+void drawAir() {
+  const char *name;
+  uint16_t color;
+  aqiLevel(air.aqi, &name, &color);
+  drawCentered(myCity.length() ? myCity : String("Your area"), 28, 1, CLAUDE_GRAY);
+  drawCentered(String(air.aqi), 42, 5, color);
+  drawCentered("US AQI", 84, 1, CLAUDE_GRAY);
+  drawCentered(name, 96, 2, color);
+  // scale from 0 to 300+, coloured by band, with a marker at today's value
+  const int bands[6] = {50, 100, 150, 200, 300, 400};
+  const uint16_t cols[6] = {CLAUDE_GREEN, CLAUDE_AMBER, CLAUDE_ORANGE, CLAUDE_RED, 0x881F, 0x8000};
+  for (int i = 0, x0 = 12; i < 6; i++) {
+    int x1 = 12 + 216 * bands[i] / 400;
+    ui->fillRect(x0, 120, x1 - x0 - 1, 6, cols[i]);
+    x0 = x1;
+  }
+  int mx = 12 + 216 * min(air.aqi, 399) / 400;
+  ui->fillTriangle(mx, 128, mx - 5, 135, mx + 5, 135, CLAUDE_CREAM);
+  char v[12];
+  snprintf(v, sizeof(v), "%.0f", air.pm25);
+  drawTile(8, 142, 108, 36, "PM2.5 ug/m3", v, CLAUDE_CREAM);
+  snprintf(v, sizeof(v), "%.0f", air.pm10);
+  drawTile(124, 142, 108, 36, "PM10 ug/m3", v, CLAUDE_CREAM);
+  snprintf(v, sizeof(v), "%.0f", air.o3);
+  drawTile(8, 184, 108, 36, "Ozone", v, CLAUDE_CREAM);
+  snprintf(v, sizeof(v), "%.0f", air.no2);
+  drawTile(124, 184, 108, 36, "NO2", v, CLAUDE_CREAM);
+}
+// The Moon's age in days since the last new moon (one cycle is 29.53 days)
+float moonAge(time_t now) {
+  const double synodic = 29.530588853;
+  double age = fmod((now - 947182440.0) / 86400.0, synodic); // new moon of 6 Jan 2000, 18:14 UTC
+  return age < 0 ? age + synodic : age;
+}
+void drawMoon(int cx, int cy, int r, float age) {
+  float phase = age / 29.530588853f * 2 * PI; // 0 new, PI full
+  ui->fillCircle(cx, cy, r, CLAUDE_TRACK);
+  for (int y = -r; y <= r; y++) {
+    float w = sqrtf(r * r - y * y), k = cosf(phase);
+    float x0 = phase < PI ? w * k : -w, x1 = phase < PI ? w : -w * k; // lit part, waxing or waning
+    if (x1 > x0) ui->drawFastHLine(cx + (int)x0, cy + y, (int)(x1 - x0) + 1, CLAUDE_CREAM);
+  }
+}
+void drawSky() {
+  struct tm t;
+  bool clock = localNow(&t);
+  // the day as an arc from sunrise (left) to sunset (right)
+  const int cx = 120, cy = 112, R = 84;
+  for (int a = 0; a <= 180; a += 6) {
+    float r = a * DEG_TO_RAD;
+    ui->fillCircle(cx - cosf(r) * R, cy - sinf(r) * R * 0.75f, 1, CLAUDE_TRACK);
+  }
+  int nowMin = clock ? t.tm_hour * 60 + t.tm_min : -1;
+  if (nowMin >= sunRiseMin && nowMin <= sunSetMin && sunSetMin > sunRiseMin) {
+    float r = (float)(nowMin - sunRiseMin) / (sunSetMin - sunRiseMin) * PI;
+    int sx = cx - cosf(r) * R, sy = cy - sinf(r) * R * 0.75f;
+    ui->fillCircle(sx, sy, 9, CLAUDE_AMBER);
+    ui->drawCircle(sx, sy, 12 + (millis() / 300) % 3, CLAUDE_AMBER);
+  } else {
+    drawCentered("Night", 70, 2, CLAUDE_GRAY);
+  }
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_AMBER);
+  ui->setCursor(16, 118);
+  ui->print("Rise " + sunRise);
+  ui->setCursor(224 - 8 * 6, 118);
+  ui->print("Set " + sunSet);
+  char line[40];
+  snprintf(line, sizeof(line), "%dh %02dm of daylight", dayLenMin / 60, dayLenMin % 60);
+  drawCentered(line, 92, 1, CLAUDE_CREAM);
+  snprintf(line, sizeof(line), "UV up to %.0f%s", uvMax, uvMax >= 8 ? " - very high!" : uvMax >= 6 ? " - high" : "");
+  drawCentered(line, 134, 1, uvMax >= 6 ? CLAUDE_ORANGE : CLAUDE_GRAY);
+  ui->drawFastHLine(12, 148, 216, CLAUDE_TRACK);
+  // tonight's moon, worked out on the board
+  if (!timeKnown) {
+    drawCentered("Moon: waiting for the clock", 180, 1, CLAUDE_GRAY);
+    return;
+  }
+  float age = moonAge(time(nullptr));
+  drawMoon(52, 186, 26, age);
+  const char *NAMES[] = {"New moon", "Waxing crescent", "First quarter", "Waxing gibbous",
+                         "Full moon", "Waning gibbous", "Last quarter", "Waning crescent"};
+  int idx = (int)(age / 29.530588853f * 8 + 0.5f) % 8;
+  int lit = (int)roundf((1 - cosf(age / 29.530588853f * 2 * PI)) / 2 * 100);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(92, 168);
+  ui->print(NAMES[idx]);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(92, 182);
+  ui->printf("%d%% lit", lit);
+  float toFull = fmodf(14.765f - age + 29.53f, 29.53f);
+  ui->setCursor(92, 196);
+  if (toFull < 0.5f || toFull > 29.0f) ui->print("Full moon tonight!");
+  else ui->printf("Full moon in %d days", (int)roundf(toFull));
+}
+uint16_t kpColor(float kp) {
+  return kp >= 7 ? CLAUDE_RED : kp >= 5 ? CLAUDE_ORANGE : kp >= 4 ? CLAUDE_AMBER : CLAUDE_GREEN;
+}
+void drawSpaceWeather() {
+  float kp = kpHist[kpCount - 1];
+  char big[8];
+  snprintf(big, sizeof(big), "%.1f", kp);
+  drawCentered("Planetary K index", 28, 1, CLAUDE_GRAY);
+  drawCentered(big, 40, 5, kpColor(kp));
+  int g = kp >= 9 ? 5 : kp >= 8 ? 4 : kp >= 7 ? 3 : kp >= 6 ? 2 : kp >= 5 ? 1 : 0;
+  String level = g ? "G" + String(g) + " geomagnetic storm" : String(kp >= 4 ? "Active" : kp >= 3 ? "Unsettled" : "Quiet");
+  drawCentered(level, 84, 2, kpColor(kp));
+  // roughly how far from the poles the northern/southern lights reach at this Kp
+  float auroraLat = 66.5f - 2.4f * kp;
+  char line[44];
+  snprintf(line, sizeof(line), "Aurora possible above ~%.0f deg latitude", auroraLat);
+  drawCentered(line, 108, 1, CLAUDE_CREAM);
+  if (locationKnown) {
+    bool visible = fabsf(myLat) >= auroraLat;
+    drawCentered(visible ? "You might see it tonight - look up!" : "Too close to the equator here", 120, 1,
+                 visible ? CLAUDE_GREEN : CLAUDE_GRAY);
+  }
+  // the last three days, one bar every three hours
+  const int base = 206, h = 60;
+  for (int i = 0; i < kpCount; i++) {
+    int bh = max(2, (int)(kpHist[i] / 9.0f * h));
+    ui->fillRect(12 + i * 9, base - bh, 7, bh, kpColor(kpHist[i]));
+  }
+  ui->drawFastHLine(10, base - (int)(5 / 9.0f * h), 220, CLAUDE_TRACK); // storm line at Kp 5
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(12, 211);
+  ui->print("3 days ago");
+  ui->setCursor(204, 211);
+  ui->print("now");
+}
+String countdownText(int64_t secs) {
+  char buf[24];
+  bool past = secs < 0;
+  int64_t s = past ? -secs : secs;
+  int d = s / 86400, h = (s / 3600) % 24, m = (s / 60) % 60, sec = s % 60;
+  if (d > 0) snprintf(buf, sizeof(buf), "T%c %dd %02d:%02d:%02d", past ? '+' : '-', d, h, m, sec);
+  else snprintf(buf, sizeof(buf), "T%c %02d:%02d:%02d", past ? '+' : '-', h, m, sec);
+  return buf;
+}
+void drawLaunches() {
+  if (!launchCount) {
+    drawCentered("No launches scheduled", 110, 1, CLAUDE_GRAY);
+    return;
+  }
+  Launch &l = launches[0];
+  int y = drawWrapped(l.mission, 8, 30, 2, CLAUDE_CREAM, 2, 0);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_ORANGE);
+  ui->setCursor(8, y + 2);
+  ui->print(l.rocket.substring(0, 37));
+  y = drawWrapped(l.provider + " - " + l.place, 8, y + 14, 1, CLAUDE_GRAY, 2, 0);
+  if (timeKnown && l.net) drawCentered(countdownText(l.net - (int64_t)time(nullptr)), y + 8, 2, CLAUDE_AMBER);
+  uint16_t sc = l.status == "Go" ? CLAUDE_GREEN : l.status == "Hold" ? CLAUDE_RED : CLAUDE_GRAY;
+  int w = l.status.length() * 6 + 12;
+  ui->fillRoundRect(120 - w / 2, y + 30, w, 13, 6, sc);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_DARK);
+  ui->setCursor(126 - w / 2, y + 33);
+  ui->print(l.status);
+  for (int i = 1; i < launchCount; i++) { // the next ones, one line each
+    int ly = 182 + (i - 1) * 20;
+    ui->drawFastHLine(8, ly - 5, 224, CLAUDE_TRACK);
+    ui->setTextColor(CLAUDE_CREAM);
+    ui->setCursor(8, ly);
+    ui->print(launches[i].mission.substring(0, 24));
+    if (timeKnown && launches[i].net) {
+      int64_t s = launches[i].net - (int64_t)time(nullptr);
+      String when = s < 86400 ? "today" : "in " + String((int)(s / 86400)) + "d";
+      ui->setTextColor(CLAUDE_GRAY);
+      ui->setCursor(232 - when.length() * 6, ly);
+      ui->print(when);
+    }
+  }
+}
+// A big number with commas, at the largest size that fits
+void drawBigCount(long long v, int y, uint16_t color) {
+  String s = withCommas((long)min(v, 2147483647LL), false);
+  int size = s.length() <= 6 ? 5 : s.length() <= 9 ? 4 : 3;
+  drawCentered(s, y, size, color);
+}
+void drawYouTube() {
+  // the play-button logo
+  ui->fillRoundRect(96, 30, 48, 34, 10, CLAUDE_RED);
+  ui->fillTriangle(113, 38, 113, 56, 129, 47, 0xFFFF);
+  drawCentered(ytTitle.length() > 38 ? ytTitle.substring(0, 37) : ytTitle, 72, 1, CLAUDE_CREAM);
+  if (ytHidden) drawCentered("Subscriber count is hidden", 104, 1, CLAUDE_GRAY);
+  else drawBigCount(ytSubs, 88, millis() < ytPartyUntil ? CLAUDE_AMBER : 0xFFFF);
+  drawCentered("subscribers", 130, 1, CLAUDE_GRAY);
+  if (ytFirstSubs >= 0 && ytSubs > ytFirstSubs) {
+    drawCentered("+" + withCommas((long)(ytSubs - ytFirstSubs), false) + " since I switched on", 144, 1, CLAUDE_GREEN);
+  }
+  drawTile(8, 160, 108, 40, "VIEWS", withCommas((long)min(ytViews, 2147483647LL), false), CLAUDE_CREAM);
+  drawTile(124, 160, 108, 40, "VIDEOS", String((long)ytVideos), CLAUDE_CREAM);
+  drawCentered("YouTube rounds big counts", 210, 1, CLAUDE_TRACK);
+  if (millis() < ytPartyUntil) { // confetti and a dancing Clawd
+    uint32_t seed = millis() / 120; // new confetti every few frames, without touching random()
+    const uint16_t c[4] = {CLAUDE_ORANGE, CLAUDE_AMBER, CLAUDE_GREEN, CLAUDE_BLUE};
+    for (int i = 0; i < 30; i++) {
+      seed = seed * 1664525u + 1013904223u;
+      ui->fillRect((seed >> 8) % 240, 26 + (seed >> 20) % 134, 3, 3, c[i % 4]);
+    }
+    drawBot(ui, 184, 196, 4, FACE_HAPPY, (millis() / 150) % 2 ? 2 : 1, (millis() / 150) % 2 ? 1 : 2);
+  }
+}
+void drawCurrency() {
+  float home = fxRate[FX_COUNT];
+  int row = 0;
+  for (int i = 0; i < FX_COUNT; i++) {
+    if (strcmp(FX_CODES[i], HOME_CURRENCY) == 0 || fxRate[i] <= 0) continue;
+    int y = 30 + row * 31;
+    if (row++ >= 6) break;
+    float value = home / fxRate[i]; // one unit of this currency, in your currency
+    ui->drawRoundRect(6, y, 228, 27, 7, CLAUDE_TRACK);
+    ui->setTextSize(2);
+    ui->setTextColor(CLAUDE_ORANGE);
+    ui->setCursor(14, y + 6);
+    ui->printf("1 %s", FX_CODES[i]);
+    char v[16];
+    snprintf(v, sizeof(v), value >= 100 ? "%.1f" : value >= 1 ? "%.2f" : "%.4f", value);
+    String text = String(v) + " " + HOME_CURRENCY;
+    ui->setTextColor(CLAUDE_CREAM);
+    ui->setCursor(226 - text.length() * 12, y + 6);
+    ui->print(text);
+  }
+  drawCentered("European Central Bank rates, " + fxDate, 218, 1, CLAUDE_GRAY);
+}
+void drawNews() {
+  int y = 28;
+  for (int i = 0; i < newsCount && y < 214; i++) {
+    ui->fillRect(4, y + 1, 2, 18, CLAUDE_ORANGE);
+    y = drawWrapped(newsTitle[i], 10, y, 1, CLAUDE_CREAM, 2, 0);
+    ui->setTextColor(CLAUDE_GRAY);
+    ui->setCursor(10, y);
+    ui->printf("%d points - %d comments", newsPoints[i], newsComments[i]);
+    y += 14;
+  }
+}
+void drawHistory() {
+  struct tm t;
+  if (localNow(&t)) {
+    char date[16];
+    strftime(date, sizeof(date), "%d %B", &t);
+    drawCentered(date, 28, 1, CLAUDE_GRAY);
+  }
+  drawCentered("In " + histYear[histSel], 42, 3, CLAUDE_ORANGE);
+  String &text = histText[histSel];
+  int size = text.length() <= 120 ? 2 : 1;
+  drawWrapped(text, 10, 76, size, CLAUDE_CREAM, size == 2 ? 7 : 12, 0);
+  char nav[24];
+  snprintf(nav, sizeof(nav), "^v %d/%d   OK more", histSel + 1, histCount);
+  drawCentered(nav, 216, 1, CLAUDE_GRAY);
+}
+void drawWiki() {
+  int y = drawWrapped(wikiTitle, 8, 28, 2, CLAUDE_CREAM, 2, 0);
+  if (wikiDesc.length()) y = drawWrapped(wikiDesc, 8, y + 1, 1, CLAUDE_ORANGE, 2, 0);
+  ui->drawFastHLine(8, y + 2, 224, CLAUDE_TRACK);
+  int lines = (210 - (y + 8)) / 11;
+  drawWrapped(wikiText, 8, y + 8, 1, CLAUDE_GRAY, lines, wikiScroll);
+  drawCentered("^v scroll   OK another", 216, 1, CLAUDE_TRACK);
+}
+void drawTrivia() {
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(8, 28);
+  ui->print(triviaCat.substring(0, 28));
+  char score[12];
+  snprintf(score, sizeof(score), "%d/%d", triviaScore, triviaAsked);
+  ui->setTextColor(CLAUDE_ORANGE);
+  ui->setCursor(232 - strlen(score) * 6, 28);
+  ui->print(score);
+  int size = triviaQ.length() <= 64 ? 2 : 1;
+  drawWrapped(triviaQ, 8, 42, size, CLAUDE_CREAM, size == 2 ? 4 : 6, 0);
+  for (int i = 0; i < 4; i++) {
+    int y = 112 + i * 27;
+    uint16_t fill = triviaChosen < 0 ? (i == triviaSel ? CLAUDE_ORANGE : 0)
+                    : i == triviaRight ? CLAUDE_GREEN
+                    : i == triviaChosen ? CLAUDE_RED
+                                        : 0;
+    if (fill) ui->fillRoundRect(6, y, 228, 23, 8, fill);
+    else ui->drawRoundRect(6, y, 228, 23, 8, CLAUDE_TRACK);
+    ui->setTextSize(1);
+    ui->setTextColor(fill ? CLAUDE_DARK : CLAUDE_CREAM);
+    ui->setCursor(14, y + 8);
+    ui->print((char)('A' + i));
+    ui->print("  ");
+    ui->print(triviaA[i].substring(0, 34));
+  }
+  if (triviaChosen >= 0) drawCentered(triviaChosen == triviaRight ? "Correct! OK: next" : "Not quite. OK: next", 222, 1, CLAUDE_CREAM);
+}
+void drawJoke() {
+  drawBubble(ui, 8, 28, 224, 92, 46, 132);
+  int size = jokeSetup.length() <= 90 ? 2 : 1;
+  drawWrapped(jokeSetup, 16, 36, size, CLAUDE_DARK, size == 2 ? 4 : 7, 0);
+  unsigned long t = millis() - jokeShownAt;
+  bool laughing = jokeShown && t < 2500;
+  int bob = laughing ? (int)(4 * sinf(t / 60.0f)) : 0;
+  drawBot(ui, 22, 140 + bob, 6, jokeShown ? FACE_HAPPY : FACE_LOOK_RIGHT, laughing ? ((t / 150) % 2 ? 2 : 1) : 0, 0);
+  if (jokeShown) {
+    drawWrapped(jokePunch, 76, 140, jokePunch.length() <= 52 ? 2 : 1, CLAUDE_ORANGE, 6, 0);
+  } else {
+    ui->setTextSize(1);
+    ui->setTextColor(CLAUDE_GRAY);
+    ui->setCursor(82, 160);
+    ui->print("OK: tell me!");
+  }
+}
+// Buttons that pages use for themselves (LEFT/RIGHT always flip pages)
+void worldButtons(int w) {
+  bool ok = pycamera.justPressed(AWEXP_BUTTON_OK);
+  bool up = pycamera.justPressed(AWEXP_BUTTON_UP), down = pycamera.justPressed(AWEXP_BUTTON_DOWN);
+  switch (w) {
+    case W_TRIVIA:
+      if (!wHasData[w]) break;
+      if (triviaChosen < 0) {
+        if (up) triviaSel = (triviaSel + 3) % 4;
+        if (down) triviaSel = (triviaSel + 1) % 4;
+        if (ok) {
+          triviaChosen = triviaSel;
+          triviaAsked++;
+          if (triviaChosen == triviaRight) {
+            triviaScore++;
+            petBoost(3);
+            pycamera.speaker_tone(1318, 70);
+            pycamera.speaker_tone(1760, 110);
+          } else {
+            pycamera.speaker_tone(330, 200);
+          }
+          prefs.putInt("trv_ok", triviaScore);
+          prefs.putInt("trv_n", triviaAsked);
+        }
+        return;
+      }
+      break; // answered: OK fetches the next question
+    case W_JOKE:
+      if (ok && wHasData[w] && !jokeShown) {
+        jokeShown = true;
+        jokeShownAt = millis();
+        petBoost(3);
+        for (int i = 0; i < 3; i++) pycamera.speaker_tone(1568 + i * 200, 50); // ba-dum-tss
+        return;
+      }
+      break;
+    case W_HISTORY:
+      if (histCount && up) histSel = (histSel + histCount - 1) % histCount;
+      if (histCount && down) histSel = (histSel + 1) % histCount;
+      break;
+    case W_WIKI:
+      if (down) wikiScroll++;
+      if (up && wikiScroll > 0) wikiScroll--;
+      break;
+  }
+  if (ok) wFetchedAt[w] = 0; // refresh now
+}
+// Why a page has nothing to show yet
+String worldWaitText(int w) {
+  if (wError[w].length()) return wError[w];
+  if (w == W_YOUTUBE && !youtubeConfigured()) return "Add YT_HANDLE and YT_API_KEY in YOUR SETTINGS";
+  if (w == W_HISTORY && !timeKnown) return "Waiting for the clock...";
+  if (needsLocation(w) && !locationKnown)
+    return locateTried && webWidget != W_LOCATE ? "Couldn't find your location. Retrying..." : "Asking your phone where we are...";
+  if (WiFi.status() != WL_CONNECTED) return "Waiting for WiFi...";
+  return "Loading...";
+}
+
 void worldMode() {
-  if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) worldPage = (worldPage + W_PAGES - 1) % W_PAGES;
-  if (pycamera.justPressed(AWEXP_BUTTON_RIGHT)) worldPage = (worldPage + 1) % W_PAGES;
-  if (pycamera.justPressed(AWEXP_BUTTON_OK)) wFetchedAt[worldPage] = 0; // refresh now
+  const uint8_t *set = feedMode ? FEED_SET : WORLD_SET;
+  int n = feedMode ? sizeof(FEED_SET) : sizeof(WORLD_SET);
+  int &idx = feedMode ? feedIdx : worldIdx;
+  if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) idx = (idx + n - 1) % n;
+  if (pycamera.justPressed(AWEXP_BUTTON_RIGHT)) idx = (idx + 1) % n;
+  worldPage = set[idx];
+  worldButtons(worldPage);
   worldTick();
   static unsigned long lastDraw = 0;
   if (millis() - lastDraw < 50) return;
@@ -2292,14 +3054,12 @@ void worldMode() {
   ui->setCursor(26, 5);
   ui->print(W_TITLES[w]);
   // live / loading / error dot
-  bool loading = webWidget == w || (webWidget == W_LOCATE && (w == W_WEATHER || w == W_PLANES));
+  bool loading = webWidget == w || (webWidget == W_LOCATE && needsLocation(w));
   ui->fillCircle(230, 11, 4, loading ? CLAUDE_AMBER : wError[w].length() ? CLAUDE_RED : wHasData[w] ? CLAUDE_GREEN : CLAUDE_TRACK);
   if (!wHasData[w]) {
-    String msg = wError[w].length()                                         ? wError[w]
-                 : (w == W_WEATHER || w == W_PLANES) && !locationKnown      ? String(locateTried && webWidget != W_LOCATE ? "Couldn't find your location. Retrying..." : "Asking your phone where we are...")
-                 : WiFi.status() != WL_CONNECTED                            ? String("Waiting for WiFi...")
-                                                                            : String("Loading...");
-    drawCentered(msg, 110, 1, CLAUDE_GRAY);
+    String lines[3];
+    int count = wrapText(worldWaitText(w), 36, lines, 3);
+    for (int i = 0; i < count; i++) drawCentered(lines[i], 104 + i * 12, 1, CLAUDE_GRAY);
   } else {
     switch (w) {
       case W_WEATHER: drawWeather(); break;
@@ -2307,9 +3067,20 @@ void worldMode() {
       case W_ISS: drawIss(); break;
       case W_QUAKES: drawQuakes(); break;
       case W_CRYPTO: drawCrypto(); break;
+      case W_AIR: drawAir(); break;
+      case W_SKY: drawSky(); break;
+      case W_SPACEWX: drawSpaceWeather(); break;
+      case W_LAUNCH: drawLaunches(); break;
+      case W_YOUTUBE: drawYouTube(); break;
+      case W_FX: drawCurrency(); break;
+      case W_NEWS: drawNews(); break;
+      case W_HISTORY: drawHistory(); break;
+      case W_WIKI: drawWiki(); break;
+      case W_TRIVIA: drawTrivia(); break;
+      case W_JOKE: drawJoke(); break;
     }
   }
-  for (int i = 0; i < W_PAGES; i++) ui->fillCircle(96 + i * 12, 233, i == w ? 3 : 2, i == w ? CLAUDE_ORANGE : CLAUDE_TRACK);
+  for (int i = 0; i < n; i++) ui->fillCircle(120 - (n - 1) * 6 + i * 12, 233, i == idx ? 3 : 2, i == idx ? CLAUDE_ORANGE : CLAUDE_TRACK);
   ui->setTextSize(1);
   ui->setTextColor(CLAUDE_GRAY);
   ui->setCursor(4, 229);
@@ -3773,7 +4544,7 @@ const char *modeName() {
     case MODE_ALARMS: return "Alarms";
     case MODE_ALARM_RING: return "Alarm ringing!";
     case MODE_FACE: return "Face Finder";
-    case MODE_WORLD: return "World Live";
+    case MODE_WORLD: return feedMode ? "Daily Feed" : "World Live";
     case MODE_GAME:
     case MODE_GAME_MENU: return "Games";
     case MODE_TOOL:
@@ -4440,6 +5211,8 @@ void setup() {
   }
   prefs.begin("clawd", false);
   langSel = prefs.getUChar("lang", 1) % LANG_COUNT; // Hindi until you pick another
+  triviaScore = prefs.getInt("trv_ok", 0);
+  triviaAsked = prefs.getInt("trv_n", 0);
   if (!bridgeUrl.length()) bridgeUrl = prefs.getString("bridge", "");   // where the phone was last time
   if (!bridgeToken.length()) bridgeToken = prefs.getString("token", ""); // paired before
   calibrateAccel();
@@ -4661,11 +5434,12 @@ void handleMenuNavigation() {
       case 4: currentMode = MODE_PET; break;
       case 5: currentMode = MODE_ALARMS; alarmField = -1; break;
       case 6: currentMode = MODE_FACE; break;
-      case 7: currentMode = MODE_WORLD; break;
-      case 8: currentMode = MODE_GAME_MENU; break;
-      case 9: currentMode = MODE_TOOLS; break;
-      case 10: currentMode = MODE_CAMERA; break;
-      case 11: currentMode = MODE_HOME_ASSISTANT; break;
+      case 7: currentMode = MODE_WORLD; feedMode = false; break;
+      case 8: currentMode = MODE_WORLD; feedMode = true; break;
+      case 9: currentMode = MODE_GAME_MENU; break;
+      case 10: currentMode = MODE_TOOLS; break;
+      case 11: currentMode = MODE_CAMERA; break;
+      case 12: currentMode = MODE_HOME_ASSISTANT; break;
     }
   }
 }

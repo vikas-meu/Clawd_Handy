@@ -83,7 +83,7 @@
   <text class="item" x="400" y="404">Open-Meteo · OpenSky</text>
   <text class="item" x="400" y="422">wheretheiss.at · USGS</text>
   <text class="item" x="400" y="440">CoinGecko · ipwho.is</text>
-  <text class="item" x="400" y="462">+ NTP internet time</text>
+  <text class="item" x="400" y="462">+ YouTube, NOAA, Wikipedia…</text>
 
   <!-- phone -->
   <rect class="box" x="70" y="398" width="160" height="92" rx="14"/>

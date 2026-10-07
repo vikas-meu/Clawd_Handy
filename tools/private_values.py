@@ -25,6 +25,8 @@ PLACEHOLDERS = {
     "WIFI_PASSWORD": "your-wifi-password",
     "BOTtoken": "123456789:your-telegram-bot-token",
     "CHAT_ID": "your-telegram-chat-id",
+    "YT_HANDLE": "@yourchannel",
+    "YT_API_KEY": "your-youtube-api-key",
 }
 LINE = re.compile(r'^(#define (\w+) )"((?:[^"\\\r\n]|\\.)*)"( *// private[^\r\n]*)(?=\r?\n|\Z)', re.M)
 
