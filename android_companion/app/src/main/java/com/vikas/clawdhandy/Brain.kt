@@ -97,6 +97,26 @@ class Brain private constructor(private val app: Context) {
             return BetaJsonOutputFormat.builder().schema(schema).build()
         }
 
+        /** JSON shape for scavenger-hunt clues: each riddle and the spot where it gets hidden. */
+        internal fun huntFormat(): BetaJsonOutputFormat {
+            val clue = mapOf(
+                "type" to "object",
+                "properties" to mapOf(
+                    "clue" to mapOf("type" to "string", "description" to "A short riddle (max 18 words, plain ASCII) that points to the spot"),
+                    "spot" to mapOf("type" to "string", "description" to "2-4 word name of the hiding spot, e.g. under the doormat")
+                ),
+                "required" to listOf("clue", "spot"),
+                "additionalProperties" to false
+            )
+            val schema = BetaJsonOutputFormat.Schema.builder()
+                .putAdditionalProperty("type", JsonValue.from("object"))
+                .putAdditionalProperty("properties", JsonValue.from(mapOf("clues" to mapOf("type" to "array", "items" to clue))))
+                .putAdditionalProperty("required", JsonValue.from(listOf("clues")))
+                .putAdditionalProperty("additionalProperties", JsonValue.from(false))
+                .build()
+            return BetaJsonOutputFormat.builder().schema(schema).build()
+        }
+
         private fun tool(name: String, description: String, properties: Map<String, Any>, required: List<String>): BetaTool {
             val props = BetaTool.InputSchema.Properties.builder()
             properties.forEach { (key, schema) -> props.putAdditionalProperty(key, JsonValue.from(schema)) }
@@ -254,6 +274,33 @@ class Brain private constructor(private val app: Context) {
                 Reply(true, BoardText.ascii(answer).ifBlank { "Hmm, I have no answer for that." }, speak = answer)
             }
         }
+    }
+
+    /** Riddle clues for a scavenger hunt around the home. [Reply.answer] holds the JSON. */
+    fun hunt(theme: String, count: Int): Reply = guard {
+        val n = count.coerceIn(3, 8)
+        val response = send(
+            "You write fun, kid-friendly scavenger hunt clues.",
+            listOf(
+                user(
+                    BetaContentBlockParam.ofText(
+                        "Write exactly $n riddle clues for a scavenger hunt at home. Theme: ${theme.ifBlank { "anything fun" }}. " +
+                            "Each clue points to an everyday hiding spot in a different part of a house, where the next " +
+                            "QR code will be hidden. Keep each clue under 18 words, plain ASCII, no emoji."
+                    )
+                )
+            ),
+            withTools = false,
+            format = huntFormat()
+        )
+        val clues = runCatching { JSONObject(finalText(response)).getJSONArray("clues") }.getOrNull()
+            ?: return@guard Reply(false, "The clues came back garbled. Try again.")
+        val clean = JSONArray()
+        for (i in 0 until minOf(clues.length(), n)) {
+            val c = clues.getJSONObject(i)
+            clean.put(JSONObject().put("clue", BoardText.ascii(c.optString("clue"))).put("spot", BoardText.ascii(c.optString("spot"))))
+        }
+        Reply(true, clean.toString())
     }
 
     // ------------------------------------------------------------------ ask (with tools)

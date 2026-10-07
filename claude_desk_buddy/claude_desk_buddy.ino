@@ -29,12 +29,31 @@
 #include <esp_sntp.h>
 #include <ESPmDNS.h>
 #include <qrcode.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "img_converters.h"
+#include <driver/i2s_pdm.h>
+#include "mp3dec.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "person_model.h"
 // Claude screens (declared up here so Arduino's auto-generated prototypes can see them)
 enum Face { FACE_NORMAL, FACE_BLINK, FACE_HAPPY, FACE_WORRIED, FACE_DEAD, FACE_LOOK_LEFT, FACE_LOOK_RIGHT };
-enum NetJob { JOB_NONE, JOB_USAGE, JOB_ASK_IMAGE, JOB_FACE, JOB_WEB, JOB_QR, JOB_LOCATION, JOB_LISTEN, JOB_TALK };
+enum NetJob { JOB_NONE, JOB_USAGE, JOB_ASK_IMAGE, JOB_FACE, JOB_WEB, JOB_QR, JOB_LOCATION, JOB_LISTEN, JOB_TALK,
+              JOB_NOWPLAY, JOB_ART, JOB_MEDIA, JOB_BROWSE, JOB_HUNT, JOB_LISTEN2 };
 enum TalkState { TALK_IDLE, TALK_LISTENING, TALK_THINKING, TALK_ANSWER };
 enum AskState { ASK_PREVIEW, ASK_THINKING, ASK_ANSWER };
 struct Alarm { bool on; uint8_t hour, minute, repeat; };
+// What Clawds say to each other over ESP-NOW (Friends, chat, Pong Duel)
+struct __attribute__((packed)) ClawdPacket {
+  char magic[4]; // "CLWD"
+  uint8_t type;
+  char name[13];
+  uint8_t food, energy, fun, flags; // flags bit 0: waiting in the Pong Duel lobby
+  int16_t a, b, c, d, e, f;
+  char text[24];
+};
 // ===================== YOUR SETTINGS =====================
 // Put your own values here. Lines ending in "// private" are swapped back to these placeholders
 // whenever you commit (see tools/private_values.py), so they never reach GitHub; your copy keeps
@@ -55,6 +74,8 @@ struct Alarm { bool on; uint8_t hour, minute, repeat; };
 #define YT_API_KEY "your-youtube-api-key" // private
 // Daily Feed > Currency: rates are shown in this currency
 #define HOME_CURRENCY "INR"
+// Friends: your Clawd's name as other boards see it ("" = Clawd-XXXX from the board's address)
+#define CLAWD_NAME ""
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
 // Pin definitions
@@ -124,12 +145,18 @@ enum Mode {
   MODE_PET,
   MODE_TOOLS,
   MODE_TOOL,
-  MODE_TALK
+  MODE_TALK,
+  MODE_RETRO,
+  MODE_NOWPLAY,
+  MODE_BROWSER,
+  MODE_MUSIC,
+  MODE_FRIENDS
 };
 Mode currentMode = MODE_IDLE;
 int menuSelection = 0;
 const char* menuOptions[] = {"Clawd Talk", "Claude Ask", "API Status", "Claude Dance", "Clawd Pet", "Alarms",
-                             "Face Finder", "World Live", "Daily Feed", "Games", "Toolbox", "Camera Mode", "Home Assistant"};
+                             "Face Finder", "World Live", "Daily Feed", "Retro Cam", "Now Playing", "Browser",
+                             "Music", "Friends", "Games", "Toolbox", "Camera Mode", "Home Assistant"};
 int numMenuOptions = sizeof(menuOptions) / sizeof(menuOptions[0]);
 // Function prototypes
 void drawMenu();
@@ -387,6 +414,8 @@ size_t netBodyLen = 0;
 const char *netContentType = "";
 int netStatus = 0;
 String netResponse;
+uint8_t *artJpg = NULL; // album art JPEG from the phone (Now Playing)
+size_t artJpgLen = 0;
 TaskHandle_t netTaskHandle = NULL;
 Preferences prefs;             // flash storage: alarms, clock, scores, pet, reminders, phone address
 String bridgeUrl = BRIDGE_URL; // replaced automatically when the phone turns up at another IP
@@ -429,7 +458,9 @@ int bridgeRequest() {
   HTTPClient http;
   http.setConnectTimeout(3000);
   // Claude (and web searches) can take a while; listening lasts until you stop talking
-  http.setTimeout(netJob == JOB_ASK_IMAGE || netJob == JOB_TALK ? 75000 : netJob == JOB_LISTEN ? 30000 : 10000);
+  http.setTimeout(netJob == JOB_ASK_IMAGE || netJob == JOB_TALK || netJob == JOB_HUNT ? 75000
+                  : netJob == JOB_LISTEN || netJob == JOB_LISTEN2 || netJob == JOB_BROWSE ? 30000
+                                                                                        : 10000);
   int status = -1;
   if (http.begin(bridgeUrl + netPath)) {
     if (bridgeToken.length()) http.addHeader("X-Clawd-Token", bridgeToken);
@@ -439,7 +470,14 @@ int bridgeRequest() {
     } else {
       status = http.GET();
     }
-    if (status > 0) netResponse = http.getString();
+    if (status == 200 && netJob == JOB_ART) { // binary JPEG, not JSON
+      int len = http.getSize();
+      if (len > 0 && len < 65536 && (artJpg = (uint8_t *)ps_malloc(len))) {
+        artJpgLen = http.getStreamPtr()->readBytes(artJpg, len);
+      }
+    } else if (status > 0) {
+      netResponse = http.getString();
+    }
     http.end();
   }
   return status;
@@ -1043,6 +1081,15 @@ void handleWebResult(int status, const String &body);
 void handleQrResult(bool parsed, JsonDocument &doc);
 void handleListenResult(bool parsed, JsonDocument &doc);
 void handleTalkResult(bool parsed, JsonDocument &doc);
+void handleNowPlayingResult(bool parsed, JsonDocument &doc);
+void handleBrowseResult(bool parsed, JsonDocument &doc);
+void handleHuntResult(bool parsed, JsonDocument &doc);
+void handleHuntQr(bool parsed, JsonDocument &doc);
+void handleListen2Result(bool parsed, JsonDocument &doc);
+void handleArtResult();
+extern bool huntScanning;
+extern int huntState;
+extern volatile bool musicPlaying;
 // Called every loop(): hands a finished network job's result to its screen
 void serviceNetJob() {
   if (bridgeMoved) { // remember where the phone was, for a quicker start next boot
@@ -1060,14 +1107,22 @@ void serviceNetJob() {
     free(netBody);
     netBody = NULL;
   }
-  if (job == JOB_WEB || job == JOB_LOCATION) {
+  if (job == JOB_ART) {
+    handleArtResult();
+  } else if (job == JOB_WEB || job == JOB_LOCATION) {
     handleWebResult(netStatus, netResponse);
   } else {
     JsonDocument doc;
     bool parsed = netStatus == 200 && !deserializeJson(doc, netResponse);
     if (job == JOB_USAGE) handleUsageResult(parsed, doc);
     else if (job == JOB_FACE) handleFaceResult(parsed, doc);
+    else if (job == JOB_QR && huntScanning) handleHuntQr(parsed, doc);
     else if (job == JOB_QR) handleQrResult(parsed, doc);
+    else if (job == JOB_NOWPLAY) handleNowPlayingResult(parsed, doc);
+    else if (job == JOB_BROWSE) handleBrowseResult(parsed, doc);
+    else if (job == JOB_HUNT) handleHuntResult(parsed, doc);
+    else if (job == JOB_LISTEN2) handleListen2Result(parsed, doc);
+    else if (job == JOB_MEDIA) {} // nothing to show
     else if (job == JOB_LISTEN) handleListenResult(parsed, doc);
     else if (job == JOB_TALK) handleTalkResult(parsed, doc);
     else handleAskResult(parsed, doc);
@@ -1393,6 +1448,7 @@ void checkAlarms() {
 }
 void ringAlarm() {
   if (currentMode == MODE_ALARM_RING) return;
+  musicStop();
   if (currentMode == MODE_SLEEP) wakeUp();
   stopDance();
   modeBeforeAlarm = currentMode == MODE_DANCE ? MODE_USAGE : currentMode;
@@ -3095,10 +3151,13 @@ void worldMode() {
 #define GAME_BLOCKS 1
 #define GAME_2048 2
 #define GAME_TILT 3
-#define GAME_COUNT 4
-const char *GAME_NAMES[] = {"Flappy Clawd", "Block Drop", "2048", "Tilt Catch"};
+#define GAME_BEATS 4
+#define GAME_DUEL 5
+#define GAME_COUNT 6
+const char *GAME_NAMES[] = {"Flappy Clawd", "Block Drop", "2048", "Tilt Catch", "Clawd Beats", "Pong Duel"};
 const char *GAME_HINTS[] = {"OK / Shutter / UP: flap", "</> move  UP turn  DN fast  Shutter drop",
-                            "D-pad: slide the tiles", "Tilt the board to steer"};
+                            "D-pad: slide the tiles", "Tilt the board to steer",
+                            "Hit < ^ > on the beat", "2 boards, same WiFi: UP/DN paddle"};
 int gameSelection = 0, currentGame = 0;
 uint32_t bestScores[GAME_COUNT];
 uint32_t gameScore = 0;
@@ -3585,6 +3644,8 @@ void startGame(int g) {
     case GAME_BLOCKS: blocksStart(); break;
     case GAME_2048: tilesStart(); break;
     case GAME_TILT: tiltStart(); break;
+    case GAME_BEATS: beatsStart(); break;
+    case GAME_DUEL: duelStart(); break;
   }
 }
 void drawGameMenu() {
@@ -3595,18 +3656,18 @@ void drawGameMenu() {
   ui->setCursor(38, 11);
   ui->print("Games");
   for (int i = 0; i < GAME_COUNT; i++) {
-    int y = 40 + i * 40;
+    int y = 34 + i * 28;
     bool sel = i == gameSelection;
-    if (sel) ui->fillRoundRect(10, y, 220, 34, 8, CLAUDE_ORANGE);
-    else ui->drawRoundRect(10, y, 220, 34, 8, CLAUDE_TRACK);
+    if (sel) ui->fillRoundRect(10, y, 220, 24, 8, CLAUDE_ORANGE);
+    else ui->drawRoundRect(10, y, 220, 24, 8, CLAUDE_TRACK);
     ui->setTextSize(2);
     ui->setTextColor(sel ? CLAUDE_DARK : CLAUDE_CREAM);
-    ui->setCursor(20, y + 9);
+    ui->setCursor(20, y + 5);
     ui->print(GAME_NAMES[i]);
     String best = "Best " + String(bestScores[i]);
     ui->setTextSize(1);
     ui->setTextColor(sel ? CLAUDE_DARK : CLAUDE_GRAY);
-    ui->setCursor(222 - best.length() * 6, y + 13);
+    ui->setCursor(222 - best.length() * 6, y + 9);
     ui->print(best);
   }
   drawCentered(GAME_HINTS[gameSelection], 206, 1, CLAUDE_GRAY);
@@ -3632,6 +3693,8 @@ void drawGame() {
     case GAME_BLOCKS: blocksDraw(); break;
     case GAME_2048: tilesDraw(); break;
     case GAME_TILT: tiltDraw(); break;
+    case GAME_BEATS: beatsDraw(); break;
+    case GAME_DUEL: duelDraw(); break;
   }
   if (gameOver) drawGameOver();
   pushUi();
@@ -3649,10 +3712,12 @@ void gameMode() {
   // 2048 and Block Drop react to every press; the action games tick at a steady 30 fps
   if (currentGame == GAME_2048) tilesUpdate();
   if (currentGame == GAME_BLOCKS) blocksUpdate();
+  if (currentGame == GAME_BEATS) beatsUpdate(); // judged on every press, not just every frame
   if (gameOver || millis() - gameTick < 33) return;
   gameTick = millis();
   if (currentGame == GAME_FLAPPY) flappyUpdate();
   if (currentGame == GAME_TILT) tiltUpdate();
+  if (currentGame == GAME_DUEL) duelUpdate();
   if (!gameOver) drawGame();
 }
 
@@ -3877,11 +3942,15 @@ void petMode() {
 #define TOOL_QR 4
 #define TOOL_HOME 5
 #define TOOL_REMOTE 6
-#define TOOL_COUNT 7
-const char *TOOL_NAMES[] = {"Pomodoro", "Spirit Level", "Photo Booth", "Timelapse", "QR Scanner", "Home Controls", "Phone Remote"};
+#define TOOL_AI 7
+#define TOOL_HUNT 8
+#define TOOL_COUNT 9
+const char *TOOL_NAMES[] = {"Pomodoro", "Spirit Level", "Photo Booth", "Timelapse", "QR Scanner", "Home Controls",
+                            "Phone Remote", "Person Detector", "Scavenger Hunt"};
 const char *TOOL_HINTS[] = {"Focus timer with breaks", "Is it straight?", "3-2-1 photo to the SD card",
                             "Record a timelapse, play it back", "Read QR codes (phone companion)",
-                            "Your light, fan and robots", "Control me from your phone"};
+                            "Your light, fan and robots", "Control me from your phone",
+                            "A neural net on the board, offline", "Claude writes riddles, you hide QR codes"};
 int toolSelection = 0, currentTool = 0;
 // Title + scrolling list of 6 rows, used by the Toolbox menu
 void drawListScreen(const char *title, const char *const *items, int count, int sel, const char *hint) {
@@ -4470,6 +4539,7 @@ void startTool(int t) {
   if (t == TOOL_BOOTH) boothStart = 0;
   if (t == TOOL_QR) qrText = "";
   if (t == TOOL_REMOTE) remoteDrawn = false;
+  if (t == TOOL_HUNT && huntState == 4) huntState = 3;
 }
 void toolsMenuMode() {
   if (pycamera.justPressed(AWEXP_BUTTON_UP)) toolSelection = (toolSelection + TOOL_COUNT - 1) % TOOL_COUNT;
@@ -4492,6 +4562,8 @@ void toolMode() {
     case TOOL_QR: qrTool(); break;
     case TOOL_HOME: homeTool(); break;
     case TOOL_REMOTE: remoteTool(); break;
+    case TOOL_AI: aiTool(); break;
+    case TOOL_HUNT: huntTool(); break;
   }
 }
 
@@ -4551,6 +4623,11 @@ const char *modeName() {
     case MODE_TOOLS: return "Toolbox";
     case MODE_SLEEP: return "Sleeping (clock)";
     case MODE_HOME_ASSISTANT: return "Home Assistant";
+    case MODE_RETRO: return "Retro Cam";
+    case MODE_NOWPLAY: return "Now Playing";
+    case MODE_BROWSER: return "Browser";
+    case MODE_MUSIC: return "Music";
+    case MODE_FRIENDS: return "Friends";
     default: return "Menu";
   }
 }
@@ -4671,8 +4748,1970 @@ void webTick() {
   else if (path == "/api/status") webStatus(c);
   else if (path == "/api/alarm") webAlarm(c, query);
   else if (path == "/api/action") webAction(c, query);
+  else if (webExtraRoute(c, path, query)) {} // Retro Cam gallery, hunt codes
   else webReply(c, 404, "text/plain", "not found");
   c.stop();
+}
+
+// ===================== FUN LAB =====================
+// Retro Cam, Now Playing, Browser, Music, Friends, Clawd Beats, Pong Duel, Person Detector
+// and the Scavenger Hunt. Everything here is extra: nothing above depends on it.
+#define RGB565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
+// 0-255 brightness of an RGB565 pixel
+uint8_t lum565(uint16_t c) {
+  return (uint8_t)((((c >> 11) & 0x1F) * 8 * 77 + ((c >> 5) & 0x3F) * 4 * 150 + (c & 0x1F) * 8 * 29) >> 8);
+}
+// First unused name like /retrocam/RC0007.jpg
+String sdNextName(const char *dir, const char *prefix, const char *ext) {
+  if (!pycamera.sd.exists(dir)) pycamera.sd.mkdir(dir);
+  char p[48];
+  for (int i = 1; i < 10000; i++) {
+    snprintf(p, sizeof(p), "%s/%s%04d.%s", dir, prefix, i, ext);
+    if (!pycamera.sd.exists(p)) return p;
+  }
+  return "";
+}
+// Saves a 240x240 RGB565 screen image to the SD card as a JPEG
+bool saveScreenJpeg(const uint16_t *px, const String &path) {
+  uint16_t *be = (uint16_t *)ps_malloc(240 * 240 * 2);
+  if (!be) return false;
+  for (int i = 0; i < 240 * 240; i++) be[i] = (px[i] >> 8) | (px[i] << 8); // the encoder wants camera byte order
+  uint8_t *jpg = NULL;
+  size_t len = 0;
+  bool ok = fmt2jpg((uint8_t *)be, 240 * 240 * 2, 240, 240, PIXFORMAT_RGB565, 85, &jpg, &len);
+  free(be);
+  if (ok) {
+    File f = pycamera.sd.open(path.c_str(), FILE_WRITE);
+    ok = f && f.write(jpg, len) == len;
+    f.close();
+  }
+  free(jpg);
+  return ok;
+}
+
+// ---- Animated GIF writer (streams frames straight to the SD card) ----
+File gifFile;
+uint8_t gifBlock[255];
+int gifBlockLen = 0, gifAccBits = 0, gifMinCode = 8;
+uint32_t gifAcc = 0;
+#define GIF_HASH 8191
+uint32_t *gifKeys = NULL; // LZW dictionary: (prefix code << 8 | pixel) -> code
+int16_t *gifCodes = NULL;
+bool gifBegin(const String &path, const uint16_t *pal, int ncolors) {
+  int bits = 2;
+  while ((1 << bits) < ncolors) bits++;
+  gifMinCode = bits;
+  if (!gifKeys) gifKeys = (uint32_t *)ps_malloc(GIF_HASH * sizeof(uint32_t));
+  if (!gifCodes) gifCodes = (int16_t *)ps_malloc(GIF_HASH * sizeof(int16_t));
+  if (!gifKeys || !gifCodes) return false;
+  gifFile = pycamera.sd.open(path.c_str(), FILE_WRITE);
+  if (!gifFile) return false;
+  uint8_t hdr[13] = {'G', 'I', 'F', '8', '9', 'a', 240, 0, 240, 0, (uint8_t)(0x80 | ((bits - 1) << 4) | (bits - 1)), 0, 0};
+  gifFile.write(hdr, 13);
+  for (int i = 0; i < (1 << bits); i++) { // global colour table
+    uint16_t c = i < ncolors ? pal[i] : 0;
+    uint8_t rgb[3] = {(uint8_t)((c >> 8) & 0xF8), (uint8_t)((c >> 3) & 0xFC), (uint8_t)((c << 3) & 0xF8)};
+    gifFile.write(rgb, 3);
+  }
+  static const uint8_t LOOP[19] = {0x21, 0xFF, 0x0B, 'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0', 0x03, 0x01, 0x00, 0x00, 0x00};
+  gifFile.write(LOOP, 19); // loop forever
+  return true;
+}
+void gifByte(uint8_t b) {
+  gifBlock[gifBlockLen++] = b;
+  if (gifBlockLen == 255) {
+    gifFile.write((uint8_t)255);
+    gifFile.write(gifBlock, 255);
+    gifBlockLen = 0;
+  }
+}
+void gifCode(int code, int size) {
+  gifAcc |= (uint32_t)code << gifAccBits;
+  gifAccBits += size;
+  while (gifAccBits >= 8) {
+    gifByte(gifAcc & 0xFF);
+    gifAcc >>= 8;
+    gifAccBits -= 8;
+  }
+}
+// One 240x240 frame of palette indices, shown for delayCs hundredths of a second
+void gifFrame(const uint8_t *px, int delayCs) {
+  uint8_t gce[8] = {0x21, 0xF9, 0x04, 0x00, (uint8_t)(delayCs & 0xFF), (uint8_t)(delayCs >> 8), 0x00, 0x00};
+  gifFile.write(gce, 8);
+  uint8_t desc[10] = {0x2C, 0, 0, 0, 0, 240, 0, 240, 0, 0x00};
+  gifFile.write(desc, 10);
+  gifFile.write((uint8_t)gifMinCode);
+  const int clear = 1 << gifMinCode;
+  int codeSize = gifMinCode + 1, maxCode = clear + 1;
+  memset(gifKeys, 0xFF, GIF_HASH * sizeof(uint32_t));
+  gifAcc = 0;
+  gifAccBits = 0;
+  gifBlockLen = 0;
+  gifCode(clear, codeSize);
+  int cur = px[0];
+  for (int i = 1; i < 240 * 240; i++) { // LZW, the same scheme as the classic gif.h
+    uint8_t c = px[i];
+    uint32_t key = ((uint32_t)cur << 8) | c;
+    uint32_t h = (key * 2654435761u) % GIF_HASH;
+    while (gifKeys[h] != 0xFFFFFFFF && gifKeys[h] != key) h = (h + 1) % GIF_HASH;
+    if (gifKeys[h] == key) {
+      cur = gifCodes[h];
+      continue;
+    }
+    gifCode(cur, codeSize);
+    gifKeys[h] = key;
+    gifCodes[h] = ++maxCode;
+    if (maxCode >= (1 << codeSize)) codeSize++;
+    if (maxCode == 4095) { // dictionary full: start a fresh one
+      gifCode(clear, codeSize);
+      memset(gifKeys, 0xFF, GIF_HASH * sizeof(uint32_t));
+      codeSize = gifMinCode + 1;
+      maxCode = clear + 1;
+    }
+    cur = c;
+  }
+  gifCode(cur, codeSize);
+  gifCode(clear, codeSize);
+  gifCode(clear + 1, gifMinCode + 1);
+  if (gifAccBits > 0) gifByte(gifAcc & 0xFF);
+  if (gifBlockLen) {
+    gifFile.write((uint8_t)gifBlockLen);
+    gifFile.write(gifBlock, gifBlockLen);
+  }
+  gifFile.write((uint8_t)0);
+}
+void gifEnd() {
+  gifFile.write((uint8_t)0x3B);
+  gifFile.close();
+}
+
+// ---- Retro Cam: Game Boy Camera look, filters, photos and GIFs ----
+#define RC_FILTERS 8
+const char *RC_NAMES[] = {"Game Boy", "1-bit", "Pixel art", "ASCII", "Glitch", "Thermal", "Sketch", "Normal"};
+const uint16_t RC_GB[4] = {RGB565(15, 56, 15), RGB565(48, 98, 48), RGB565(139, 172, 15), RGB565(155, 188, 15)};
+const uint16_t RC_BIT[2] = {RGB565(20, 20, 19), RGB565(250, 249, 245)};
+const uint16_t RC_ASCII[2] = {RGB565(8, 12, 8), RGB565(51, 255, 102)};
+const uint16_t RC_PICO[16] = {RGB565(0, 0, 0),       RGB565(29, 43, 83),    RGB565(126, 37, 83),   RGB565(0, 135, 81),
+                              RGB565(171, 82, 54),   RGB565(95, 87, 79),    RGB565(194, 195, 199), RGB565(255, 241, 232),
+                              RGB565(255, 0, 77),    RGB565(255, 163, 0),   RGB565(255, 236, 39),  RGB565(0, 228, 54),
+                              RGB565(41, 173, 255),  RGB565(131, 118, 156), RGB565(255, 119, 168), RGB565(255, 204, 170)};
+const uint8_t BAYER4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+const char RC_RAMP[] = " .:-=+*#%@";
+int rcFilter = 0;
+uint8_t *rcIdx = NULL;  // palette index of every pixel, for GIFs
+uint8_t *rcLum = NULL;  // brightness buffer for the sketch filter
+uint16_t rcPal332[256]; // fixed 256-colour palette for full-colour GIFs
+uint16_t rcThermal[256];
+bool rcReady = false, rcShare = false, rcShareDrawn = false;
+int rcGifFrames = 0;    // > 0 while a GIF is recording
+unsigned long rcGifNext = 0, rcToastUntil = 0, rcFlashUntil = 0;
+String rcLastFile, rcGifPath, rcToast;
+bool retroInit() {
+  if (rcReady) return true;
+  rcIdx = (uint8_t *)ps_malloc(240 * 240);
+  rcLum = (uint8_t *)ps_malloc(240 * 240);
+  if (!rcIdx || !rcLum) return false;
+  for (int i = 0; i < 256; i++) rcPal332[i] = RGB565((i >> 5) * 255 / 7, ((i >> 2) & 7) * 255 / 7, (i & 3) * 255 / 3);
+  // thermal camera colours: black, blue, purple, red, orange, yellow, white
+  const uint8_t stops[7][4] = {{0, 0, 0, 0}, {50, 20, 0, 120}, {100, 160, 0, 150}, {150, 255, 40, 0},
+                               {200, 255, 170, 0}, {235, 255, 240, 60}, {255, 255, 255, 230}};
+  for (int v = 0; v < 256; v++) {
+    int k = 0;
+    while (k < 5 && v > stops[k + 1][0]) k++;
+    float t = (float)(v - stops[k][0]) / max(1, stops[k + 1][0] - stops[k][0]);
+    rcThermal[v] = RGB565((int)(stops[k][1] + t * (stops[k + 1][1] - stops[k][1])),
+                          (int)(stops[k][2] + t * (stops[k + 1][2] - stops[k][2])),
+                          (int)(stops[k][3] + t * (stops[k + 1][3] - stops[k][3])));
+  }
+  rcReady = true;
+  return true;
+}
+// Draws src through the current filter into dst. Returns the small palette it used (and its size),
+// or NULL for full-colour filters, whose GIF frames use the fixed 256-colour palette.
+const uint16_t *retroFilter(const uint16_t *src, uint16_t *dst, int *ncolors) {
+  switch (rcFilter) {
+    case 0:   // Game Boy: 4 greens with ordered dithering
+    case 1: { // 1-bit: 2 tones with ordered dithering
+      int levels = rcFilter == 0 ? 4 : 2;
+      const uint16_t *pal = rcFilter == 0 ? RC_GB : RC_BIT;
+      for (int y = 0; y < 240; y++)
+        for (int x = 0; x < 240; x++) {
+          int i = y * 240 + x;
+          float l = constrain((lum565(src[i]) - 110) * 1.4f + 128, 0.0f, 255.0f); // punchier contrast
+          float v = l / 255.0f * (levels - 1) + (BAYER4[(y & 3) * 4 + (x & 3)] / 16.0f - 0.47f);
+          int q = constrain((int)(v + 0.5f), 0, levels - 1);
+          rcIdx[i] = q;
+          dst[i] = pal[q];
+        }
+      *ncolors = levels;
+      return pal;
+    }
+    case 2: // pixel art: 6x6 blocks in the PICO-8 palette
+      for (int by = 0; by < 240; by += 6)
+        for (int bx = 0; bx < 240; bx += 6) {
+          int r = 0, g = 0, b = 0;
+          for (int y = by; y < by + 6; y++)
+            for (int x = bx; x < bx + 6; x++) {
+              uint16_t c = src[y * 240 + x];
+              r += (c >> 8) & 0xF8;
+              g += (c >> 3) & 0xFC;
+              b += (c << 3) & 0xF8;
+            }
+          r /= 36;
+          g /= 36;
+          b /= 36;
+          int best = 0;
+          long bestD = LONG_MAX;
+          for (int k = 0; k < 16; k++) {
+            uint16_t p = RC_PICO[k];
+            long dr = r - ((p >> 8) & 0xF8), dg = g - ((p >> 3) & 0xFC), db = b - ((p << 3) & 0xF8);
+            long d = dr * dr * 3 + dg * dg * 4 + db * db * 2;
+            if (d < bestD) {
+              bestD = d;
+              best = k;
+            }
+          }
+          for (int y = by; y < by + 6; y++)
+            for (int x = bx; x < bx + 6; x++) {
+              rcIdx[y * 240 + x] = best;
+              dst[y * 240 + x] = RC_PICO[best];
+            }
+        }
+      *ncolors = 16;
+      return RC_PICO;
+    case 3: { // ASCII art: one character per 6x8 cell, green-screen style
+      for (int i = 0; i < 240 * 240; i++) dst[i] = RC_ASCII[0];
+      for (int cy = 0; cy < 30; cy++)
+        for (int cx = 0; cx < 40; cx++) {
+          int sum = 0;
+          for (int y = 0; y < 8; y += 2)
+            for (int x = 0; x < 6; x += 2) sum += lum565(src[(cy * 8 + y) * 240 + cx * 6 + x]);
+          char ch = RC_RAMP[min(9, sum / 12 * 10 / 256)];
+          if (ch != ' ') ui->drawChar(cx * 6, cy * 8, ch, RC_ASCII[1], RC_ASCII[0], 1);
+        }
+      for (int i = 0; i < 240 * 240; i++) rcIdx[i] = dst[i] == RC_ASCII[1];
+      *ncolors = 2;
+      return RC_ASCII;
+    }
+    case 4: { // glitch: torn rows, split colour channels, scanlines
+      uint32_t seed = millis() / 120;
+      for (int y = 0; y < 240; y++) {
+        uint32_t h = (y / 8 + seed) * 2654435761u;
+        int shift = (h % 7 == 0) ? (int)(h >> 24) % 40 - 20 : 0;
+        bool dim = y % 3 == 0;
+        for (int x = 0; x < 240; x++) {
+          int xr = constrain(x + shift + 4, 0, 239), xg = constrain(x + shift, 0, 239), xb = constrain(x + shift - 4, 0, 239);
+          uint16_t r = src[y * 240 + xr] & 0xF800, g = src[y * 240 + xg] & 0x07E0, b = src[y * 240 + xb] & 0x001F;
+          uint16_t c = r | g | b;
+          if (dim) c = (c >> 1) & 0x7BEF; // half brightness
+          dst[y * 240 + x] = c;
+        }
+      }
+      break;
+    }
+    case 5: // thermal camera
+      for (int i = 0; i < 240 * 240; i++) dst[i] = rcThermal[lum565(src[i])];
+      break;
+    case 6: // pencil sketch: inverted edges on paper
+      for (int i = 0; i < 240 * 240; i++) rcLum[i] = lum565(src[i]);
+      for (int y = 0; y < 240; y++)
+        for (int x = 0; x < 240; x++) {
+          int v = 255;
+          if (x > 0 && y > 0 && x < 239 && y < 239) {
+            const uint8_t *p = rcLum + y * 240 + x;
+            int gx = -p[-241] - 2 * p[-1] - p[239] + p[-239] + 2 * p[1] + p[241];
+            int gy = -p[-241] - 2 * p[-240] - p[-239] + p[239] + 2 * p[240] + p[241];
+            v = 255 - min(255, (abs(gx) + abs(gy)) * 3 / 4);
+          }
+          dst[y * 240 + x] = RGB565(v, v, v * 15 / 16);
+        }
+      break;
+    default:
+      memcpy(dst, src, 240 * 240 * 2);
+      break;
+  }
+  *ncolors = 256;
+  return NULL;
+}
+void retroShareScreen() {
+  ui->fillScreen(CLAUDE_DARK);
+  drawClaudeLogo(ui, 20, 18, 11, 0, CLAUDE_ORANGE);
+  ui->setTextSize(2);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(38, 11);
+  ui->print("Share");
+  if (WiFi.status() != WL_CONNECTED) {
+    drawCentered("Connect to WiFi to share", 110, 1, CLAUDE_GRAY);
+  } else {
+    String name = rcLastFile.substring(rcLastFile.lastIndexOf('/') + 1);
+    String url = "http://" + WiFi.localIP().toString() + "/rc?f=" + name;
+    drawQrCode(url, 120, 108, 150);
+    drawCentered(name, 190, 1, CLAUDE_CREAM);
+    drawCentered("Scan with a phone on this WiFi", 204, 1, CLAUDE_GRAY);
+  }
+  drawCentered("Any button: back   /gallery: all", 226, 1, CLAUDE_GRAY);
+  pushUi();
+}
+void retroMode() {
+  if (!retroInit()) {
+    ui->fillScreen(CLAUDE_DARK);
+    drawCentered("Not enough memory for Retro Cam", 110, 1, CLAUDE_RED);
+    pushUi();
+    return;
+  }
+  if (rcShare) { // the share QR stays until any button
+    if (!rcShareDrawn) {
+      retroShareScreen();
+      rcShareDrawn = true;
+    }
+    if (pycamera.justPressed(AWEXP_BUTTON_OK) || pycamera.justPressed(SHUTTER_BUTTON) || pycamera.justPressed(AWEXP_BUTTON_UP) ||
+        pycamera.justPressed(AWEXP_BUTTON_DOWN) || pycamera.justPressed(AWEXP_BUTTON_LEFT) || pycamera.justPressed(AWEXP_BUTTON_RIGHT))
+      rcShare = false;
+    return;
+  }
+  if (!rcGifFrames) { // the palette has to stay the same for a whole GIF
+    if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) rcFilter = (rcFilter + RC_FILTERS - 1) % RC_FILTERS;
+    if (pycamera.justPressed(AWEXP_BUTTON_RIGHT)) rcFilter = (rcFilter + 1) % RC_FILTERS;
+  }
+  if (!pycamera.captureFrame()) return;
+  uint16_t *src = (uint16_t *)pycamera.fb->getBuffer(), *dst = ui->getBuffer();
+  int ncolors;
+  const uint16_t *pal = retroFilter(src, dst, &ncolors);
+  esp_camera_fb_return(pycamera.frame); // we drew our own copy; hand the camera its buffer back
+  pycamera.frame = NULL;
+  if (pycamera.justPressed(SHUTTER_BUTTON) && !rcGifFrames) { // photo
+    String path = sdNextName("/retrocam", "RC", "jpg");
+    bool ok = path.length() && saveScreenJpeg(dst, path);
+    rcToast = ok ? "Saved " + path.substring(10) : String(pycamera.SDdetected() ? "Couldn't save" : "No SD card");
+    rcToastUntil = millis() + 2000;
+    if (ok) {
+      rcLastFile = path;
+      rcFlashUntil = millis() + 120;
+      pycamera.speaker_tone(1800, 30);
+      petBoost(2);
+    }
+  }
+  if (pycamera.justPressed(AWEXP_BUTTON_OK) && !rcGifFrames) { // 12-frame GIF
+    rcGifPath = sdNextName("/retrocam", "RC", "gif");
+    if (rcGifPath.length() && gifBegin(rcGifPath, pal ? pal : rcPal332, pal ? ncolors : 256)) {
+      rcGifFrames = 1;
+      rcGifNext = 0;
+      pycamera.speaker_tone(1320, 30);
+    } else {
+      rcToast = pycamera.SDdetected() ? "Couldn't start the GIF" : "No SD card";
+      rcToastUntil = millis() + 2000;
+    }
+  }
+  if (rcGifFrames && millis() >= rcGifNext) {
+    if (!pal) // full colour: map every pixel to the fixed 256-colour palette
+      for (int i = 0; i < 240 * 240; i++) {
+        uint16_t c = dst[i];
+        rcIdx[i] = (((c >> 13) & 7) << 5) | (((c >> 8) & 7) << 2) | ((c >> 3) & 3);
+      }
+    gifFrame(rcIdx, 15);
+    rcGifNext = millis() + 150;
+    if (++rcGifFrames > 12) {
+      gifEnd();
+      rcGifFrames = 0;
+      rcLastFile = rcGifPath;
+      rcToast = "GIF saved " + rcGifPath.substring(10);
+      rcToastUntil = millis() + 2500;
+      pycamera.speaker_tone(1568, 60);
+      petBoost(3);
+    }
+  }
+  if (pycamera.justPressed(AWEXP_BUTTON_UP) && rcLastFile.length()) {
+    rcShare = true;
+    rcShareDrawn = false;
+    return;
+  }
+  // overlay (drawn after saving, so photos and GIFs are clean)
+  if (millis() < rcFlashUntil) ui->fillScreen(0xFFFF);
+  ui->fillRect(0, 0, 240, 16, CLAUDE_DARK);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_ORANGE);
+  String name = String("< ") + RC_NAMES[rcFilter] + " >";
+  ui->setCursor(120 - name.length() * 3, 4);
+  ui->print(name);
+  if (rcGifFrames) {
+    if ((millis() / 300) % 2) ui->fillCircle(8, 8, 4, CLAUDE_RED);
+    ui->setTextColor(CLAUDE_RED);
+    ui->setCursor(196, 4);
+    ui->printf("GIF %d", rcGifFrames - 1);
+  }
+  ui->fillRect(0, 226, 240, 14, CLAUDE_DARK);
+  if (millis() < rcToastUntil) drawCentered(rcToast, 229, 1, CLAUDE_ORANGE);
+  else drawCentered(rcLastFile.length() ? "Shutter photo  OK gif  UP share" : "Shutter photo   OK gif", 229, 1, CLAUDE_CREAM);
+  pushUi();
+}
+
+// ---- Now Playing: what's on your phone, with album art and controls ----
+String npTitle, npArtist, npApp, npError;
+bool npPlaying = false, npHasArt = false, npLoaded = false, npArtValid = false;
+long npPos = 0, npDur = 0;
+int32_t npTrack = 0, npArtTrack = 0;
+unsigned long npAt = 0, npPollAt = 0;
+uint16_t *npArt = NULL; // 120x120 album art
+bool artToBuffer(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
+  for (int j = 0; j < h; j++)
+    for (int i = 0; i < w; i++)
+      if (x + i < 120 && y + j < 120) npArt[(y + j) * 120 + x + i] = bitmap[j * w + i];
+  return true;
+}
+void handleNowPlayingResult(bool parsed, JsonDocument &doc) {
+  if (!parsed) {
+    npError = phoneError(netStatus);
+    return;
+  }
+  if (!(doc["ok"] | false)) {
+    npError = (const char *)(doc["error"] | "The phone couldn't read what's playing");
+    return;
+  }
+  npError = "";
+  npLoaded = true;
+  npTitle = (const char *)(doc["title"] | "");
+  npArtist = (const char *)(doc["artist"] | "");
+  npApp = (const char *)(doc["app"] | "");
+  npPlaying = doc["playing"] | false;
+  npPos = doc["position_ms"] | 0L;
+  npDur = doc["duration_ms"] | 0L;
+  npHasArt = doc["has_art"] | false;
+  npTrack = doc["track"] | 0;
+  npAt = millis();
+  if (!npHasArt) npArtValid = false;
+}
+void handleArtResult() {
+  npArtTrack = npTrack; // don't retry a track whose art failed
+  if (netStatus == 200 && artJpg && artJpgLen) {
+    if (!npArt) npArt = (uint16_t *)ps_malloc(120 * 120 * 2);
+    if (npArt) {
+      TJpgDec.setJpgScale(1);
+      TJpgDec.setCallback(artToBuffer); // captureFrame() sets its own callback back each time
+      npArtValid = TJpgDec.drawJpg(0, 0, artJpg, artJpgLen) == JDR_OK;
+    }
+  }
+  free(artJpg);
+  artJpg = NULL;
+  artJpgLen = 0;
+}
+void mediaCommand(const char *action) {
+  if (!waitNetIdle(2000)) return;
+  uint8_t *body = (uint8_t *)ps_malloc(3);
+  if (!body) return;
+  memcpy(body, "{}", 3);
+  if (!startNetJob(JOB_MEDIA, String("/media?action=") + action, body, 2, "application/json")) free(body);
+  npPollAt = millis() - 1200; // look again soon
+}
+String mmss(long ms) {
+  char b[12];
+  snprintf(b, sizeof(b), "%ld:%02ld", ms / 60000, ms / 1000 % 60);
+  return b;
+}
+void drawMusicNote(int x, int y, int s, uint16_t c) { // a big quaver
+  ui->fillCircle(x, y, 5 * s, c);
+  ui->fillRect(x + 4 * s, y - 22 * s, 2 * s, 22 * s, c);
+  ui->fillTriangle(x + 6 * s, y - 22 * s, x + 16 * s, y - 14 * s, x + 6 * s, y - 14 * s, c);
+}
+void nowPlayingMode() {
+  if (pycamera.justPressed(AWEXP_BUTTON_OK)) {
+    npPlaying = !npPlaying;
+    npPos += npPlaying ? 0 : (long)(millis() - npAt);
+    npAt = millis();
+    mediaCommand("play_pause");
+  }
+  if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) mediaCommand("previous");
+  if (pycamera.justPressed(AWEXP_BUTTON_RIGHT)) mediaCommand("next");
+  if (pycamera.justPressed(AWEXP_BUTTON_UP)) mediaCommand("volume_up");
+  if (pycamera.justPressed(AWEXP_BUTTON_DOWN)) mediaCommand("volume_down");
+  if (!netBusy() && millis() - npPollAt > 2000) {
+    npPollAt = millis();
+    if (npHasArt && npTrack != npArtTrack) startNetJob(JOB_ART, "/nowplaying/art", NULL, 0, "");
+    else startNetJob(JOB_NOWPLAY, "/nowplaying", NULL, 0, "");
+  }
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw < 50) return;
+  lastDraw = millis();
+  unsigned long now = millis();
+  ui->fillScreen(CLAUDE_DARK);
+  if (npError.length() || !npLoaded) {
+    drawMusicNote(108, 100, 2, CLAUDE_TRACK);
+    String lines[3];
+    int n = wrapText(npError.length() ? npError : String("Asking the phone what's playing..."), 34, lines, 3);
+    for (int i = 0; i < n; i++) drawCentered(lines[i], 140 + i * 12, 1, npError.length() ? CLAUDE_CREAM : CLAUDE_GRAY);
+    drawCentered("Needs the Clawd Phone app", 220, 1, CLAUDE_GRAY);
+    pushUi();
+    return;
+  }
+  if (!npTitle.length()) {
+    drawMusicNote(108, 100, 2, CLAUDE_TRACK);
+    drawCentered("Nothing playing on your phone", 140, 1, CLAUDE_CREAM);
+    drawCentered("OK: play   < >: previous / next", 220, 1, CLAUDE_GRAY);
+    pushUi();
+    return;
+  }
+  // album art (or a big note), gently bobbing while it plays
+  int bob = npPlaying ? (int)(2 * sinf(now / 300.0f)) : 0;
+  if (npArtValid && npArt) {
+    ui->drawRGBBitmap(60, 14 + bob, npArt, 120, 120);
+    ui->drawRoundRect(58, 12 + bob, 124, 124, 6, CLAUDE_TRACK);
+  } else {
+    ui->fillRoundRect(60, 14 + bob, 120, 120, 10, 0x2104);
+    drawMusicNote(112, 92 + bob, 2, CLAUDE_ORANGE);
+  }
+  // title (scrolls when long), artist, app
+  String t = npTitle;
+  if (t.length() > 19) {
+    String loop = t + "     " + t;
+    int off = (now / 180) % (t.length() + 5);
+    t = loop.substring(off, off + 19);
+  }
+  drawCentered(t, 142, 2, CLAUDE_CREAM);
+  drawCentered(npArtist.length() > 38 ? npArtist.substring(0, 37) + "." : npArtist, 162, 1, CLAUDE_ORANGE);
+  drawCentered(npApp, 174, 1, CLAUDE_GRAY);
+  // progress
+  long pos = npPos + (npPlaying ? (long)(now - npAt) : 0);
+  if (npDur > 0) pos = min(pos, npDur);
+  ui->fillRoundRect(40, 190, 160, 5, 2, CLAUDE_TRACK);
+  if (npDur > 0) ui->fillRoundRect(40, 190, max(5, (int)(160 * pos / npDur)), 5, 2, CLAUDE_ORANGE);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(4, 189);
+  ui->print(mmss(pos));
+  if (npDur > 0) {
+    String d = mmss(npDur);
+    ui->setCursor(236 - d.length() * 6, 189);
+    ui->print(d);
+  }
+  // controls: previous, play/pause, next
+  ui->fillTriangle(84, 214, 94, 207, 94, 221, CLAUDE_CREAM);
+  ui->fillTriangle(76, 214, 86, 207, 86, 221, CLAUDE_CREAM);
+  ui->fillCircle(120, 214, 12, CLAUDE_ORANGE);
+  if (npPlaying) {
+    ui->fillRect(114, 207, 4, 14, CLAUDE_DARK);
+    ui->fillRect(122, 207, 4, 14, CLAUDE_DARK);
+  } else {
+    ui->fillTriangle(116, 206, 116, 222, 128, 214, CLAUDE_DARK);
+  }
+  ui->fillTriangle(156, 214, 146, 207, 146, 221, CLAUDE_CREAM);
+  ui->fillTriangle(164, 214, 154, 207, 154, 221, CLAUDE_CREAM);
+  // Clawd vibes along
+  int arm = npPlaying ? ((now / 300) % 2 ? 2 : 1) : 0;
+  drawBot(ui, 12, 216 - (npPlaying ? (int)(3 * fabsf(sinf(now / 300.0f))) : 0), 3, npPlaying ? FACE_HAPPY : FACE_BLINK, arm, 2 - arm);
+  ui->setCursor(192, 226);
+  ui->print("^v vol");
+  pushUi();
+}
+
+// ---- Browser: the web as text, Lynx-style (the phone fetches and simplifies pages) ----
+#define BR_MAX_LINES 400
+#define BR_MAX_LINKS 40
+#define BR_VISIBLE 17
+const char *BR_HOME[] = {"Say a site or a search...", "en.wikipedia.org/wiki/Special:Random", "news.ycombinator.com",
+                         "lite.cnn.com",                "text.npr.org",                          "github.com/trending"};
+#define BR_HOME_COUNT 6
+String brLines[BR_MAX_LINES];
+uint8_t brKind[BR_MAX_LINES]; // 0 text, 1 heading
+String brLinkText[BR_MAX_LINKS], brLinkUrl[BR_MAX_LINKS];
+String brTitle, brUrl, brError, brPending, brLoadingWhat;
+String brHistory[8];
+int brLineCount = 0, brLinkCount = 0, brHistLen = 0;
+int brState = 0; // 0 home, 1 loading, 2 page, 3 links
+int brScroll = 0, brSel = 0, brHomeSel = 0;
+bool brPushHistory = true;
+#define LP_BROWSER 1
+#define LP_HUNT 2
+int listenPurpose = 0;
+void browserOpen(const String &input, bool remember) {
+  brPending = input;
+  brPushHistory = remember;
+  brLoadingWhat = input;
+  brState = 1;
+  brError = "";
+}
+// Called from browserMode(): sends a queued page request once the network is free
+void browserTick() {
+  if (!brPending.length() || netBusy()) return;
+  JsonDocument req;
+  req["input"] = brPending;
+  size_t len = measureJson(req);
+  uint8_t *body = (uint8_t *)ps_malloc(len + 1);
+  if (body) serializeJson(req, (char *)body, len + 1);
+  if (body && startNetJob(JOB_BROWSE, "/browse", body, len, "application/json")) {
+    brPending = "";
+  } else {
+    free(body);
+  }
+}
+void handleBrowseResult(bool parsed, JsonDocument &doc) {
+  if (!parsed || !(doc["ok"] | false)) {
+    brError = parsed ? String((const char *)(doc["error"] | "Couldn't open that")) : phoneError(netStatus);
+    brState = brLineCount ? 2 : 0;
+    return;
+  }
+  if (brPushHistory && brUrl.length()) {
+    if (brHistLen == 8) {
+      for (int i = 1; i < 8; i++) brHistory[i - 1] = brHistory[i];
+      brHistLen--;
+    }
+    brHistory[brHistLen++] = brUrl;
+  }
+  brTitle = (const char *)(doc["title"] | "");
+  brUrl = (const char *)(doc["url"] | "");
+  brLineCount = 0;
+  String wrapped[24];
+  for (JsonObject b : doc["blocks"].as<JsonArray>()) {
+    bool heading = strcmp(b["t"] | "p", "h") == 0;
+    int n = wrapText((const char *)(b["x"] | ""), 38, wrapped, 24);
+    for (int i = 0; i < n && brLineCount < BR_MAX_LINES; i++) {
+      brKind[brLineCount] = heading;
+      brLines[brLineCount++] = wrapped[i];
+    }
+    if (brLineCount < BR_MAX_LINES) {
+      brKind[brLineCount] = 0;
+      brLines[brLineCount++] = "";
+    }
+  }
+  brLinkCount = 0;
+  for (JsonObject l : doc["links"].as<JsonArray>()) {
+    if (brLinkCount >= BR_MAX_LINKS) break;
+    brLinkText[brLinkCount] = (const char *)(l["text"] | "");
+    brLinkUrl[brLinkCount++] = (const char *)(l["url"] | "");
+  }
+  brScroll = 0;
+  brSel = 0;
+  brState = 2;
+  pycamera.speaker_tone(1320, 15);
+}
+void browserListen() {
+  if (!waitNetIdle(4000)) return;
+  listenPurpose = LP_BROWSER;
+  if (startNetJob(JOB_LISTEN2, "/listen", NULL, 0, "")) {
+    brState = 1;
+    brLoadingWhat = "Listening... speak to your phone";
+  }
+}
+void drawBrowserTitle(const String &title) {
+  ui->fillRect(0, 0, 240, 15, 0x2104);
+  drawClaudeLogo(ui, 8, 7, 5, 0, CLAUDE_ORANGE);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(17, 4);
+  ui->print(title.length() > 36 ? title.substring(0, 35) + "." : title);
+}
+void browserMode() {
+  browserTick();
+  unsigned long now = millis();
+  if (pycamera.justPressed(SHUTTER_BUTTON)) browserListen();
+  if (brState == 0) { // home: bookmarks
+    if (pycamera.justPressed(AWEXP_BUTTON_UP)) brHomeSel = (brHomeSel + BR_HOME_COUNT - 1) % BR_HOME_COUNT;
+    if (pycamera.justPressed(AWEXP_BUTTON_DOWN)) brHomeSel = (brHomeSel + 1) % BR_HOME_COUNT;
+    if (pycamera.justPressed(AWEXP_BUTTON_OK)) {
+      if (brHomeSel == 0) browserListen();
+      else browserOpen(BR_HOME[brHomeSel], true);
+    }
+    if (pycamera.justPressed(AWEXP_BUTTON_RIGHT) && brLineCount) brState = 2;
+  } else if (brState == 2) { // reading
+    if (pressedOrRepeat(AWEXP_BUTTON_DOWN)) brScroll = min(max(0, brLineCount - BR_VISIBLE), brScroll + 3);
+    if (pressedOrRepeat(AWEXP_BUTTON_UP)) brScroll = max(0, brScroll - 3);
+    if (pycamera.justPressed(AWEXP_BUTTON_OK) && brLinkCount) brState = 3;
+    if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) {
+      if (brHistLen) browserOpen(brHistory[--brHistLen], false);
+      else brState = 0;
+    }
+  } else if (brState == 3) { // picking a link
+    if (pressedOrRepeat(AWEXP_BUTTON_DOWN)) brSel = min(brLinkCount - 1, brSel + 1);
+    if (pressedOrRepeat(AWEXP_BUTTON_UP)) brSel = max(0, brSel - 1);
+    if (pycamera.justPressed(AWEXP_BUTTON_OK)) browserOpen(brLinkUrl[brSel], true);
+    if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) brState = 2;
+  }
+  static unsigned long lastDraw = 0;
+  if (now - lastDraw < 50) return;
+  lastDraw = now;
+  ui->fillScreen(CLAUDE_DARK);
+  if (brState == 0) {
+    drawBrowserTitle("Clawd Browser");
+    for (int i = 0; i < BR_HOME_COUNT; i++) {
+      int y = 24 + i * 30;
+      bool sel = i == brHomeSel;
+      if (sel) ui->fillRoundRect(6, y, 228, 26, 8, CLAUDE_ORANGE);
+      else ui->drawRoundRect(6, y, 228, 26, 8, CLAUDE_TRACK);
+      ui->setTextSize(1);
+      ui->setTextColor(sel ? CLAUDE_DARK : CLAUDE_CREAM);
+      ui->setCursor(16, y + 9);
+      String s = BR_HOME[i];
+      ui->print(s.length() > 35 ? s.substring(0, 34) + "." : s);
+    }
+    if (brError.length()) drawCentered(brError.substring(0, 38), 208, 1, CLAUDE_RED);
+    drawCentered(brLineCount ? "OK open  Shutter speak  > back to page" : "OK open   Shutter: speak a site", 226, 1, CLAUDE_GRAY);
+  } else if (brState == 1) {
+    drawBrowserTitle("Loading");
+    drawClaudeLogo(ui, 120, 100, 26, now * 0.3f, CLAUDE_ORANGE);
+    String lines[3];
+    int n = wrapText(brLoadingWhat, 34, lines, 3);
+    for (int i = 0; i < n; i++) drawCentered(lines[i], 148 + i * 12, 1, CLAUDE_CREAM);
+    drawCentered("The phone fetches it, the board reads it", 226, 1, CLAUDE_GRAY);
+  } else if (brState == 2) {
+    drawBrowserTitle(brTitle.length() ? brTitle : brUrl);
+    ui->setTextSize(1);
+    for (int i = 0; i < BR_VISIBLE && brScroll + i < brLineCount; i++) {
+      ui->setTextColor(brKind[brScroll + i] ? CLAUDE_ORANGE : CLAUDE_CREAM);
+      ui->setCursor(4, 20 + i * 11);
+      ui->print(brLines[brScroll + i]);
+    }
+    if (brLineCount > BR_VISIBLE) { // scrollbar
+      int h = max(10, 186 * BR_VISIBLE / brLineCount), y = 20 + (186 - h) * brScroll / max(1, brLineCount - BR_VISIBLE);
+      ui->fillRect(236, y, 3, h, CLAUDE_TRACK);
+    }
+    if (brError.length()) drawCentered(brError.substring(0, 38), 212, 1, CLAUDE_RED);
+    drawCentered(String("^v scroll  OK links(") + brLinkCount + ")  < back", 228, 1, CLAUDE_GRAY);
+  } else {
+    drawBrowserTitle("Links on this page");
+    int first = constrain(brSel - 6, 0, max(0, brLinkCount - 14));
+    for (int i = first; i < first + 14 && i < brLinkCount; i++) {
+      int y = 20 + (i - first) * 14;
+      if (i == brSel) ui->fillRect(0, y - 2, 240, 13, CLAUDE_ORANGE);
+      ui->setTextColor(i == brSel ? CLAUDE_DARK : CLAUDE_CREAM);
+      ui->setCursor(4, y);
+      ui->print(brLinkText[i].length() > 38 ? brLinkText[i].substring(0, 37) + "." : brLinkText[i]);
+    }
+    drawCentered("^v pick   OK open   < back to page", 228, 1, CLAUDE_GRAY);
+  }
+  pushUi();
+}
+
+// ---- Friends: Clawds that meet over the air (ESP-NOW, no router or phone needed) ----
+// Every board beacons its name and pet stats every few seconds. Boards on the same WiFi
+// channel (e.g. the same router) see each other, swap profiles, chat and play Pong Duel.
+#define NOW_BEACON 1
+#define NOW_CHAT 2
+#define NOW_WAVE 3
+#define NOW_PONG_STATE 4
+#define NOW_PONG_PADDLE 5
+struct NowMsg {
+  uint8_t mac[6];
+  int8_t rssi;
+  ClawdPacket p;
+};
+struct Friend {
+  uint8_t mac[6];
+  char name[13];
+  uint8_t food, energy, fun;
+  uint16_t meets;
+};
+#define MAX_FRIENDS 20
+Friend friends[MAX_FRIENDS];
+int friendCount = 0;
+unsigned long friendSeenAt[MAX_FRIENDS]; // 0 = not seen since boot
+int8_t friendRssi[MAX_FRIENDS];
+bool friendLobby[MAX_FRIENDS];
+QueueHandle_t nowQueue = NULL;
+bool nowReady = false;
+uint8_t myMac[6];
+String myName;
+unsigned long nowBeaconAt = 0;
+String newFriendName;
+unsigned long newFriendUntil = 0;
+// chat history (most recent last)
+#define CHAT_KEEP 8
+String chatText[CHAT_KEEP];
+int8_t chatWho[CHAT_KEEP]; // friend index, or -1 for me
+int chatCount = 0;
+const char *CHAT_CANNED[] = {"Hi!", "Wanna play Pong Duel?", "On my way", "Nice!", "GG", "Brb", "Look up!", "<3", "Feed your Clawd!"};
+#define CHAT_CANNED_COUNT 9
+int friendsSel = 0, chatPick = 0, chatWith = -1;
+unsigned long waveFromUntil = 0;
+bool duelLobby = false; // set by Pong Duel; shared in our beacon
+void onNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(ClawdPacket) || memcmp(data, "CLWD", 4) != 0 || !nowQueue) return;
+  NowMsg m;
+  memcpy(m.mac, info->src_addr, 6);
+  m.rssi = info->rx_ctrl ? info->rx_ctrl->rssi : 0;
+  memcpy(&m.p, data, sizeof(ClawdPacket));
+  xQueueSend(nowQueue, &m, 0); // handled in loop(), off the WiFi task
+}
+void saveFriends() {
+  prefs.putBytes("friends", friends, sizeof(Friend) * friendCount);
+}
+void nowInit() {
+  if (nowReady || WiFi.getMode() == WIFI_OFF) return;
+  esp_wifi_get_mac(WIFI_IF_STA, myMac);
+  myName = CLAWD_NAME;
+  if (!myName.length()) {
+    char n[13];
+    snprintf(n, sizeof(n), "Clawd-%02X%02X", myMac[4], myMac[5]);
+    myName = n;
+  }
+  if (esp_now_init() != ESP_OK) return;
+  nowQueue = xQueueCreate(12, sizeof(NowMsg));
+  esp_now_register_recv_cb(onNowRecv);
+  esp_now_peer_info_t peer = {};
+  memset(peer.peer_addr, 0xFF, 6); // broadcast
+  peer.ifidx = WIFI_IF_STA;
+  esp_now_add_peer(&peer);
+  size_t bytes = prefs.getBytesLength("friends");
+  if (bytes && bytes % sizeof(Friend) == 0 && bytes <= sizeof(friends)) {
+    prefs.getBytes("friends", friends, bytes);
+    friendCount = bytes / sizeof(Friend);
+  }
+  nowReady = true;
+}
+void nowSend(const uint8_t *mac, uint8_t type, const char *text, int16_t a, int16_t b, int16_t c, int16_t d, int16_t e, int16_t f) {
+  if (!nowReady) return;
+  ClawdPacket p = {};
+  memcpy(p.magic, "CLWD", 4);
+  p.type = type;
+  strlcpy(p.name, myName.c_str(), sizeof(p.name));
+  p.food = pet.food;
+  p.energy = pet.energy;
+  p.fun = pet.fun;
+  p.flags = duelLobby ? 1 : 0;
+  p.a = a;
+  p.b = b;
+  p.c = c;
+  p.d = d;
+  p.e = e;
+  p.f = f;
+  if (text) strlcpy(p.text, text, sizeof(p.text));
+  if (mac[0] != 0xFF && !esp_now_is_peer_exist(mac)) {
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, mac, 6);
+    peer.ifidx = WIFI_IF_STA;
+    esp_now_add_peer(&peer);
+  }
+  esp_now_send(mac, (uint8_t *)&p, sizeof(p));
+}
+const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+int findFriend(const uint8_t *mac) {
+  for (int i = 0; i < friendCount; i++)
+    if (!memcmp(friends[i].mac, mac, 6)) return i;
+  return -1;
+}
+bool friendHere(int i) {
+  return i >= 0 && friendSeenAt[i] && millis() - friendSeenAt[i] < 15000;
+}
+void addChat(int who, const String &text) {
+  if (chatCount == CHAT_KEEP) {
+    for (int i = 1; i < CHAT_KEEP; i++) {
+      chatText[i - 1] = chatText[i];
+      chatWho[i - 1] = chatWho[i];
+    }
+    chatCount--;
+  }
+  chatText[chatCount] = text;
+  chatWho[chatCount++] = who;
+}
+void duelOnPacket(int who, const ClawdPacket &p);
+// Called every loop(): beacons, and handles what other Clawds sent
+void friendsTick() {
+  if (!nowReady) {
+    if (WiFi.getMode() != WIFI_OFF && millis() > 3000) nowInit();
+    return;
+  }
+  if (millis() - nowBeaconAt > (duelLobby ? 1000UL : 3000UL)) {
+    nowBeaconAt = millis();
+    nowSend(BROADCAST_MAC, NOW_BEACON, NULL, 0, 0, 0, 0, 0, 0);
+  }
+  NowMsg m;
+  while (xQueueReceive(nowQueue, &m, 0) == pdTRUE) {
+    int i = findFriend(m.mac);
+    if (i < 0 && m.p.type == NOW_BEACON && friendCount < MAX_FRIENDS) { // a new friend!
+      i = friendCount++;
+      memcpy(friends[i].mac, m.mac, 6);
+      friends[i].meets = 0;
+      friendSeenAt[i] = 0;
+      newFriendName = m.p.name;
+      newFriendUntil = millis() + 4000;
+      petBoost(10);
+      if (!danceOn && !musicPlaying) pycamera.speaker_tone(1568, 40);
+    }
+    if (i < 0) continue;
+    if (!friendSeenAt[i] || millis() - friendSeenAt[i] > 10UL * 60 * 1000) { // a new meeting
+      friends[i].meets++;
+      strlcpy(friends[i].name, m.p.name, sizeof(friends[i].name));
+      friends[i].food = m.p.food;
+      friends[i].energy = m.p.energy;
+      friends[i].fun = m.p.fun;
+      saveFriends();
+    }
+    friendSeenAt[i] = millis();
+    friendRssi[i] = m.rssi;
+    friendLobby[i] = m.p.flags & 1;
+    friends[i].food = m.p.food;
+    friends[i].energy = m.p.energy;
+    friends[i].fun = m.p.fun;
+    if (m.p.type == NOW_CHAT) {
+      m.p.text[sizeof(m.p.text) - 1] = 0;
+      addChat(i, m.p.text);
+      if (!danceOn && !musicPlaying) pycamera.speaker_tone(1320, 30);
+    } else if (m.p.type == NOW_WAVE) {
+      addChat(i, String("*waves*"));
+      waveFromUntil = millis() + 2500;
+      if (!danceOn && !musicPlaying) pycamera.speaker_tone(1760, 30);
+    } else if (m.p.type == NOW_PONG_STATE || m.p.type == NOW_PONG_PADDLE) {
+      duelOnPacket(i, m.p);
+    }
+  }
+}
+uint16_t friendColor(int i) { // a stable colour per friend, from its address
+  static const uint16_t C[6] = {CLAUDE_ORANGE, CLAUDE_BLUE, CLAUDE_GREEN, CLAUDE_AMBER, 0xA37A, CLAUDE_RED};
+  return C[(friends[i].mac[4] + friends[i].mac[5]) % 6];
+}
+void friendsMode() {
+  unsigned long now = millis();
+  if (chatWith < 0) { // the list
+    if (pycamera.justPressed(AWEXP_BUTTON_UP) && friendCount) friendsSel = (friendsSel + friendCount - 1) % friendCount;
+    if (pycamera.justPressed(AWEXP_BUTTON_DOWN) && friendCount) friendsSel = (friendsSel + 1) % friendCount;
+    if (pycamera.justPressed(AWEXP_BUTTON_OK) && friendCount) {
+      chatWith = friendsSel;
+      chatPick = 0;
+    }
+    if (pycamera.justPressed(AWEXP_BUTTON_RIGHT) && friendHere(friendsSel)) {
+      nowSend(friends[friendsSel].mac, NOW_WAVE, NULL, 0, 0, 0, 0, 0, 0);
+      addChat(-1, "*waves at " + String(friends[friendsSel].name) + "*");
+    }
+  } else { // chatting
+    if (pycamera.justPressed(AWEXP_BUTTON_UP)) chatPick = (chatPick + CHAT_CANNED_COUNT - 1) % CHAT_CANNED_COUNT;
+    if (pycamera.justPressed(AWEXP_BUTTON_DOWN)) chatPick = (chatPick + 1) % CHAT_CANNED_COUNT;
+    if (pycamera.justPressed(AWEXP_BUTTON_OK)) {
+      nowSend(friends[chatWith].mac, NOW_CHAT, CHAT_CANNED[chatPick], 0, 0, 0, 0, 0, 0);
+      addChat(-1, CHAT_CANNED[chatPick]);
+      pycamera.speaker_tone(988, 15);
+    }
+    if (pycamera.justPressed(AWEXP_BUTTON_RIGHT)) {
+      nowSend(friends[chatWith].mac, NOW_WAVE, NULL, 0, 0, 0, 0, 0, 0);
+      addChat(-1, String("*waves*"));
+    }
+    if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) chatWith = -1;
+  }
+  static unsigned long lastDraw = 0;
+  if (now - lastDraw < 66) return;
+  lastDraw = now;
+  ui->fillScreen(CLAUDE_DARK);
+  drawClaudeLogo(ui, 20, 18, 11, 0, CLAUDE_ORANGE);
+  ui->setTextSize(2);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(38, 11);
+  if (chatWith < 0) {
+    ui->print("Friends");
+    ui->setTextSize(1);
+    ui->setTextColor(CLAUDE_GRAY);
+    ui->setCursor(232 - myName.length() * 6, 15);
+    ui->print(myName);
+    if (!nowReady) {
+      drawCentered("Starting the radio...", 110, 1, CLAUDE_GRAY);
+    } else if (!friendCount) {
+      drawBot(ui, 85, 70, 10, (now / 700) % 2 ? FACE_LOOK_LEFT : FACE_LOOK_RIGHT, 0, 0);
+      drawCentered("Looking for other Clawds...", 140, 1, CLAUDE_CREAM);
+      drawCentered("Another MEMENTO running Clawd Handy", 160, 1, CLAUDE_GRAY);
+      drawCentered("on the same WiFi shows up here.", 172, 1, CLAUDE_GRAY);
+    } else {
+      int first = constrain(friendsSel - 2, 0, max(0, friendCount - 5));
+      for (int i = first; i < first + 5 && i < friendCount; i++) {
+        int y = 36 + (i - first) * 36;
+        bool sel = i == friendsSel;
+        ui->drawRoundRect(6, y, 228, 32, 8, sel ? CLAUDE_ORANGE : CLAUDE_TRACK);
+        drawBot(ui, 16, y + 10, 3, friendHere(i) ? FACE_HAPPY : FACE_BLINK, friendHere(i) && (now / 300) % 2 ? 2 : 0, 0);
+        ui->fillCircle(46, y + 16, 3, friendColor(i));
+        ui->setTextSize(1);
+        ui->setTextColor(CLAUDE_CREAM);
+        ui->setCursor(54, y + 6);
+        ui->print(friends[i].name);
+        ui->setTextColor(CLAUDE_GRAY);
+        ui->setCursor(54, y + 19);
+        ui->printf("met %d time%s  fed %d%%  fun %d%%", friends[i].meets, friends[i].meets == 1 ? "" : "s", friends[i].food, friends[i].fun);
+        if (friendHere(i)) { // signal bars
+          int bars = friendRssi[i] > -55 ? 3 : friendRssi[i] > -70 ? 2 : 1;
+          for (int b = 0; b < 3; b++) ui->fillRect(206 + b * 6, y + 18 - b * 4, 4, 6 + b * 4, b < bars ? CLAUDE_GREEN : CLAUDE_TRACK);
+        } else {
+          ui->setCursor(196, y + 6);
+          ui->print("away");
+        }
+      }
+    }
+    if (now < newFriendUntil) {
+      ui->fillRoundRect(20, 196, 200, 20, 8, CLAUDE_ORANGE);
+      drawCentered("New friend: " + newFriendName + "!", 202, 1, CLAUDE_DARK);
+    }
+    drawCentered(friendCount ? "OK chat   > wave   (pet +10 fun per friend)" : "Friends make your pet happy", 226, 1, CLAUDE_GRAY);
+  } else {
+    ui->print(friends[chatWith].name);
+    ui->setTextSize(1);
+    int y = 36;
+    for (int i = max(0, chatCount - 6); i < chatCount; i++) {
+      bool mine = chatWho[i] < 0;
+      if (!mine && chatWho[i] != chatWith) continue;
+      int w = min(200, (int)chatText[i].length() * 6 + 16);
+      int x = mine ? 234 - w : 6;
+      ui->fillRoundRect(x, y, w, 18, 8, mine ? CLAUDE_ORANGE : CLAUDE_CREAM);
+      ui->setTextColor(CLAUDE_DARK);
+      ui->setCursor(x + 8, y + 5);
+      ui->print(chatText[i].substring(0, 31));
+      y += 22;
+    }
+    if (now < waveFromUntil) drawBot(ui, 180, 40, 4, FACE_HAPPY, (now / 150) % 2 ? 2 : 1, 0);
+    ui->fillRoundRect(6, 172, 228, 24, 8, 0x2104);
+    ui->setTextColor(CLAUDE_ORANGE);
+    ui->setCursor(14, 180);
+    ui->printf("^ %s v", CHAT_CANNED[chatPick]);
+    drawCentered(friendHere(chatWith) ? "OK send  > wave  < back" : "Away right now - they'll get it when near", 226, 1, CLAUDE_GRAY);
+  }
+  pushUi();
+}
+
+// ---- Pong Duel: 2 players, one Clawd each, over ESP-NOW ----
+int duelState = 0; // 0 lobby, 1 playing
+int duelPeer = -1;
+bool duelHost = false;
+float dBallX, dBallY, dVX, dVY;
+int dHostY = 90, dGuestY = 90, dScoreH = 0, dScoreG = 0;
+unsigned long duelRxAt = 0;
+void duelReset() {
+  dBallX = 120;
+  dBallY = 120;
+  dVX = (random(2) ? 2.6f : -2.6f);
+  dVY = random(-20, 21) / 10.0f;
+}
+void duelStart() {
+  duelLobby = true;
+  duelState = 0;
+  duelPeer = -1;
+  dScoreH = dScoreG = 0;
+  nowBeaconAt = 0; // tell everyone right away
+}
+void duelOnPacket(int who, const ClawdPacket &p) {
+  if (currentMode != MODE_GAME || currentGame != GAME_DUEL || who != duelPeer) return;
+  duelRxAt = millis();
+  if (p.type == NOW_PONG_STATE && !duelHost) {
+    dBallX = p.a / 10.0f;
+    dBallY = p.b / 10.0f;
+    dHostY = p.c;
+    dScoreH = p.d;
+    dScoreG = p.e;
+    if (p.f & 1) pycamera.speaker_tone(660, 20);
+  } else if (p.type == NOW_PONG_PADDLE && duelHost) {
+    dGuestY = p.a;
+  }
+}
+void duelUpdate() {
+  if (duelState == 0) { // lobby: pair with the first friend also waiting
+    for (int i = 0; i < friendCount; i++)
+      if (friendHere(i) && friendLobby[i] && millis() - friendSeenAt[i] < 4000) {
+        duelPeer = i;
+        duelHost = memcmp(myMac, friends[i].mac, 6) < 0; // the lower address runs the ball
+        duelState = 1;
+        duelRxAt = millis();
+        dHostY = dGuestY = 90;
+        duelReset();
+        pycamera.speaker_tone(1046, 60);
+        break;
+      }
+    return;
+  }
+  int &mine = duelHost ? dHostY : dGuestY;
+  if (isHeld(AWEXP_BUTTON_UP)) mine = max(20, mine - 6);
+  if (isHeld(AWEXP_BUTTON_DOWN)) mine = min(196, mine + 6);
+  if (millis() - duelRxAt > 4000) { // they left
+    duelState = 0;
+    return;
+  }
+  if (duelHost) {
+    uint8_t sound = 0;
+    dBallX += dVX;
+    dBallY += dVY;
+    if (dBallY < 24 || dBallY > 232) {
+      dVY = -dVY;
+      dBallY = constrain(dBallY, 24.0f, 232.0f);
+    }
+    if (dBallX < 14 && dBallY > dHostY - 4 && dBallY < dHostY + 44 && dVX < 0) { // host paddle, left
+      dVX = -dVX * 1.06f;
+      dVY += (dBallY - dHostY - 20) / 10.0f;
+      sound = 1;
+    }
+    if (dBallX > 226 && dBallY > dGuestY - 4 && dBallY < dGuestY + 44 && dVX > 0) { // guest paddle, right
+      dVX = -dVX * 1.06f;
+      dVY += (dBallY - dGuestY - 20) / 10.0f;
+      sound = 1;
+    }
+    if (dBallX < 0 || dBallX > 240) {
+      if (dBallX < 0) dScoreG++;
+      else dScoreH++;
+      duelReset();
+      sound = 1;
+    }
+    if (sound) pycamera.speaker_tone(660, 15);
+    nowSend(friends[duelPeer].mac, NOW_PONG_STATE, NULL, (int16_t)(dBallX * 10), (int16_t)(dBallY * 10), dHostY, dScoreH, dScoreG, sound);
+  } else {
+    nowSend(friends[duelPeer].mac, NOW_PONG_PADDLE, NULL, dGuestY, 0, 0, 0, 0, 0);
+  }
+  int me = duelHost ? dScoreH : dScoreG, them = duelHost ? dScoreG : dScoreH;
+  if (me >= 7 || them >= 7) {
+    gameScore = me;
+    duelLobby = false;
+    endGame();
+  }
+}
+void duelDraw() {
+  ui->fillScreen(CLAUDE_DARK);
+  if (duelState == 0) {
+    drawBot(ui, 85, 70, 10, (millis() / 600) % 2 ? FACE_LOOK_LEFT : FACE_LOOK_RIGHT, 1, 1);
+    drawCentered("Pong Duel", 20, 2, CLAUDE_ORANGE);
+    drawCentered("Waiting for a friend...", 140, 1, CLAUDE_CREAM);
+    drawCentered("Open Games > Pong Duel on another", 160, 1, CLAUDE_GRAY);
+    drawCentered("MEMENTO on the same WiFi", 172, 1, CLAUDE_GRAY);
+    return;
+  }
+  for (int y = 20; y < 240; y += 12) ui->fillRect(119, y, 2, 6, CLAUDE_TRACK);
+  ui->fillRoundRect(4, dHostY, 6, 40, 3, duelHost ? CLAUDE_ORANGE : CLAUDE_CREAM);
+  ui->fillRoundRect(230, dGuestY, 6, 40, 3, duelHost ? CLAUDE_CREAM : CLAUDE_ORANGE);
+  ui->fillCircle(dBallX, dBallY, 4, CLAUDE_CREAM);
+  ui->setTextSize(3);
+  ui->setTextColor(CLAUDE_GRAY);
+  ui->setCursor(80, 4);
+  ui->print(dScoreH);
+  ui->setCursor(146, 4);
+  ui->print(dScoreG);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_ORANGE);
+  ui->setCursor(duelHost ? 6 : 150, 228);
+  ui->print("you");
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(duelHost ? 150 : 6, 228);
+  ui->print(String(friends[duelPeer].name).substring(0, 13));
+}
+
+// ---- Clawd Beats: a rhythm game on top of the dance music ----
+int beatsSong = 0, beatsCombo = 0, beatsBest = 0, beatsLoops = 0, beatsPrevStep = -1;
+long beatsHitStep[32]; // steps already hit (or missed), by step % 32
+String beatsJudge;
+unsigned long beatsJudgeAt = 0;
+int beatsJudgeLane = 0;
+const int BEATS_LEAD = 16, BEATS_LEN = 256; // one bar intro, then 16 bars of notes
+// Which lane (0 left, 1 middle, 2 right) has a note on this step, or -1
+int beatsLane(long step) {
+  if (step < BEATS_LEAD || step >= BEATS_LEAD + BEATS_LEN) return -1;
+  char d = SONGS[beatsSong].drums[step % 16];
+  if (d == 'K') return 0;
+  if (d == 'S') return 2;
+  if (d == 'O' || (d == 'H' && step % 8 == 2)) return 1;
+  return -1;
+}
+float beatsNow() { // song position in 16th notes, counting loops
+  int step;
+  float phase;
+  danceClock(step, phase);
+  if (beatsPrevStep >= 0 && step < beatsPrevStep) beatsLoops++;
+  beatsPrevStep = step;
+  return beatsLoops * 64 + step + phase;
+}
+void beatsStart() {
+  beatsSong = random(SONG_COUNT);
+  beatsCombo = beatsBest = beatsLoops = 0;
+  beatsPrevStep = -1;
+  for (int i = 0; i < 32; i++) beatsHitStep[i] = -1;
+  beatsJudge = "";
+  startDance(beatsSong);
+}
+void beatsJudgeHit(const char *text, int lane) {
+  beatsJudge = text;
+  beatsJudgeAt = millis();
+  beatsJudgeLane = lane;
+}
+void beatsUpdate() {
+  float now = beatsNow();
+  int pressed = pycamera.justPressed(AWEXP_BUTTON_LEFT) ? 0 : (pycamera.justPressed(AWEXP_BUTTON_UP) || pycamera.justPressed(AWEXP_BUTTON_OK)) ? 1 : pycamera.justPressed(AWEXP_BUTTON_RIGHT) ? 2 : -1;
+  if (pressed >= 0) {
+    long best = -1;
+    float bestD = 1;
+    for (long s = (long)now - 1; s <= (long)now + 1; s++) {
+      if (beatsLane(s) != pressed || beatsHitStep[s % 32] == s) continue;
+      float d = fabsf(s - now);
+      if (d < bestD) {
+        bestD = d;
+        best = s;
+      }
+    }
+    if (best >= 0 && bestD <= 0.6f) {
+      beatsHitStep[best % 32] = best;
+      beatsCombo++;
+      beatsBest = max(beatsBest, beatsCombo);
+      bool perfect = bestD <= 0.22f;
+      gameScore += (perfect ? 100 : 50) + min(beatsCombo, 50) * 2;
+      beatsJudgeHit(perfect ? "PERFECT" : "GOOD", pressed);
+    } else {
+      beatsCombo = 0;
+      beatsJudgeHit("MISS", pressed);
+    }
+  }
+  // notes that went past the line unhit
+  long past = (long)(now - 0.7f);
+  if (beatsLane(past) >= 0 && beatsHitStep[past % 32] != past) {
+    beatsHitStep[past % 32] = past;
+    beatsCombo = 0;
+    beatsJudgeHit("MISS", beatsLane(past));
+  }
+  if (now >= BEATS_LEAD + BEATS_LEN + 4) { // song over
+    stopDance();
+    endGame();
+  }
+}
+void beatsDraw() {
+  float now = beatsNow();
+  const int LANE_X[3] = {50, 120, 190};
+  const uint16_t LANE_C[3] = {CLAUDE_ORANGE, CLAUDE_CREAM, CLAUDE_AMBER};
+  const int HIT_Y = 196;
+  ui->fillScreen(CLAUDE_DARK);
+  for (int l = 0; l < 3; l++) ui->drawFastVLine(LANE_X[l], 24, 200, 0x18C3);
+  bool kick = SONGS[beatsSong].drums[((int)now) % 16] == 'K';
+  ui->drawFastHLine(20, HIT_Y, 200, kick ? CLAUDE_ORANGE : CLAUDE_TRACK);
+  for (long s = (long)now - 1; s < (long)now + 9; s++) { // falling notes
+    int lane = beatsLane(s);
+    if (lane < 0 || beatsHitStep[s % 32] == s) continue;
+    int y = HIT_Y - (int)((s - now) * 22);
+    if (y < 20 || y > 236) continue;
+    ui->fillRoundRect(LANE_X[lane] - 18, y - 6, 36, 12, 5, LANE_C[lane]);
+  }
+  for (int l = 0; l < 3; l++) { // the three buttons
+    bool held = isHeld(l == 0 ? AWEXP_BUTTON_LEFT : l == 1 ? AWEXP_BUTTON_UP : AWEXP_BUTTON_RIGHT) || (l == 1 && isHeld(AWEXP_BUTTON_OK));
+    ui->drawCircle(LANE_X[l], HIT_Y + 18, 9, LANE_C[l]);
+    if (held) ui->fillCircle(LANE_X[l], HIT_Y + 18, 7, LANE_C[l]);
+    ui->setTextSize(1);
+    ui->setTextColor(held ? CLAUDE_DARK : LANE_C[l]);
+    ui->setCursor(LANE_X[l] - 2, HIT_Y + 15);
+    ui->print(l == 0 ? "<" : l == 1 ? "^" : ">");
+  }
+  if (millis() - beatsJudgeAt < 500 && beatsJudge.length()) {
+    uint16_t c = beatsJudge == "PERFECT" ? CLAUDE_GREEN : beatsJudge == "GOOD" ? CLAUDE_AMBER : CLAUDE_RED;
+    ui->setTextSize(1);
+    ui->setTextColor(c);
+    ui->setCursor(LANE_X[beatsJudgeLane] - beatsJudge.length() * 3, HIT_Y - 22);
+    ui->print(beatsJudge);
+  }
+  // score, combo, song, and a little Clawd dancing along
+  ui->fillRect(0, 0, 240, 22, CLAUDE_DARK);
+  ui->setTextSize(2);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(6, 4);
+  ui->print(gameScore);
+  if (beatsCombo > 2) {
+    ui->setTextSize(1);
+    ui->setTextColor(CLAUDE_ORANGE);
+    ui->setCursor(6, 22);
+    ui->printf("%d combo", beatsCombo);
+  }
+  int step;
+  float phase;
+  danceClock(step, phase);
+  int dx, dy, la, ra;
+  Face face;
+  dancePose(step, phase, (step / 16) % 4, dx, dy, la, ra, face);
+  drawBot(ui, 196 + dx / 4, 8 + dy / 3, 4, face, ra, la);
+  ui->setTextSize(1);
+  ui->setTextColor(CLAUDE_GRAY);
+  if (now < BEATS_LEAD) drawCentered(String(SONGS[beatsSong].name) + " - get ready!", 110, 1, CLAUDE_CREAM);
+  int left = max(0, (int)((BEATS_LEAD + BEATS_LEN - now) * 15000.0f / danceBpm / 1000));
+  ui->setCursor(150, 4);
+  ui->printf("%d:%02d", left / 60, left % 60);
+}
+
+// ---- Person Detector: a neural network running on the board itself ----
+const tflite::Model *aiModel = nullptr;
+tflite::MicroInterpreter *aiInterp = nullptr;
+uint8_t *aiArena = nullptr;
+#define AI_ARENA_SIZE (160 * 1024)
+float aiPerson = 0;
+unsigned long aiMs = 0, aiSeenAt = 0;
+int aiState = 0; // 0 not started, 1 ready, -1 failed
+String aiError;
+bool aiInit() {
+  if (aiState) return aiState > 0;
+  aiState = -1;
+  aiModel = tflite::GetModel(person_detect_model);
+  if (aiModel->version() != TFLITE_SCHEMA_VERSION) {
+    aiError = "Model version mismatch";
+    return false;
+  }
+  static tflite::MicroMutableOpResolver<5> resolver;
+  resolver.AddAveragePool2D();
+  resolver.AddConv2D();
+  resolver.AddDepthwiseConv2D();
+  resolver.AddReshape();
+  resolver.AddSoftmax();
+  aiArena = (uint8_t *)heap_caps_malloc(AI_ARENA_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!aiArena) {
+    aiError = "Not enough memory for the model";
+    return false;
+  }
+  static tflite::MicroInterpreter interpreter(aiModel, resolver, aiArena, AI_ARENA_SIZE);
+  aiInterp = &interpreter;
+  if (aiInterp->AllocateTensors() != kTfLiteOk) {
+    aiError = "The model didn't fit in memory";
+    return false;
+  }
+  aiState = 1;
+  return true;
+}
+void aiTool() {
+  if (!aiInit()) {
+    ui->fillScreen(CLAUDE_DARK);
+    drawCentered("Person Detector", 60, 2, CLAUDE_ORANGE);
+    drawCentered(aiError, 110, 1, CLAUDE_RED);
+    pushUi();
+    return;
+  }
+  if (!pycamera.captureFrame()) return;
+  uint16_t *src = (uint16_t *)pycamera.fb->getBuffer();
+  TfLiteTensor *in = aiInterp->input(0);
+  for (int y = 0; y < 96; y++) // 240x240 colour -> 96x96 grayscale, as the model expects
+    for (int x = 0; x < 96; x++) in->data.int8[y * 96 + x] = (int8_t)(lum565(src[(y * 5 / 2) * 240 + x * 5 / 2]) - 128);
+  unsigned long t0 = millis();
+  if (aiInterp->Invoke() == kTfLiteOk) {
+    aiMs = millis() - t0;
+    TfLiteTensor *out = aiInterp->output(0);
+    float p = (out->data.int8[1] - out->params.zero_point) * out->params.scale;
+    aiPerson = aiPerson * 0.5f + constrain(p, 0.0f, 1.0f) * 0.5f;
+  }
+  bool seen = aiPerson > 0.65f;
+  if (seen && millis() - aiSeenAt > 5000) pycamera.speaker_tone(1320, 25); // someone arrived
+  if (seen) aiSeenAt = millis();
+  PyCameraFB *fb = pycamera.fb;
+  drawCameraTitle(fb, "Person Detector - on the board");
+  fb->fillRect(0, 196, 240, 44, CLAUDE_DARK);
+  uint16_t c = seen ? CLAUDE_GREEN : aiPerson > 0.4f ? CLAUDE_AMBER : CLAUDE_GRAY;
+  fb->fillRoundRect(60, 204, 172, 10, 5, CLAUDE_TRACK);
+  fb->fillRoundRect(60, 204, max(10, (int)(172 * aiPerson)), 10, 5, c);
+  fb->setTextSize(1);
+  fb->setTextColor(c);
+  fb->setCursor(60, 220);
+  fb->printf("%s  %d%%", seen ? "Person!" : "Nobody", (int)(aiPerson * 100));
+  fb->setTextColor(CLAUDE_GRAY);
+  fb->setCursor(150, 220);
+  fb->printf("%lu ms, offline", aiMs);
+  drawBot(fb, 10, 206, 4, seen ? FACE_HAPPY : FACE_NORMAL, seen && (millis() / 200) % 2 ? 2 : seen ? 1 : 0, 0);
+  pycamera.blitFrame();
+}
+
+// ---- Scavenger Hunt: Claude writes riddles, you hide QR codes, friends race to find them ----
+#define HUNT_MAX 8
+const char *HUNT_THEMES[] = {"Pirate treasure", "Space mission", "Dinosaur dig", "Secret agents", "Birthday surprise", "Say a theme..."};
+#define HUNT_THEME_COUNT 6
+const char *HUNT_FALLBACK[8][2] = {
+  {"I keep food cold but my light comes on when you visit.", "the fridge"},
+  {"Four legs, no feet. Everyone gathers here to eat.", "under the dining table"},
+  {"Rest your head and look beneath.", "under a pillow"},
+  {"Plates and cups get a bath with me.", "by the kitchen sink"},
+  {"Shoes come home and rest with me.", "the shoe rack"},
+  {"I show your face each morning.", "the bathroom mirror"},
+  {"Stories sleep on my shelves.", "the bookshelf"},
+  {"Open my doors to find your clothes.", "the wardrobe"}};
+String huntClue[HUNT_MAX], huntSpot[HUNT_MAX], huntTheme, huntMsg, huntId;
+int huntCount = 5, huntThemeSel = 0, huntIdx = 0, huntShow = 0;
+int huntState = 0; // 0 setup, 1 asking Claude, 2 hide the codes, 3 playing, 4 scanning, 5 finished
+unsigned long huntStart = 0, huntCheerUntil = 0, huntTime = 0, lastHuntScan = 0;
+bool huntScanning = false;
+String huntCode(int i) {
+  return "CLAWD-HUNT:" + huntId + ":" + String(i);
+}
+void huntUseFallback() {
+  for (int i = 0; i < huntCount; i++) {
+    huntClue[i] = HUNT_FALLBACK[i][0];
+    huntSpot[i] = HUNT_FALLBACK[i][1];
+  }
+}
+void huntBegin() { // new codes every game, so last time's QR codes don't count
+  char id[5];
+  snprintf(id, sizeof(id), "%04X", (unsigned)(esp_random() & 0xFFFF));
+  huntId = id;
+  huntShow = 0;
+  huntState = 2;
+}
+void huntRequest() {
+  huntState = 1;
+  huntMsg = "";
+  if (!waitNetIdle(4000)) {
+    huntUseFallback();
+    huntMsg = "Phone busy: using built-in clues";
+    return huntBegin();
+  }
+  JsonDocument req;
+  req["theme"] = huntTheme;
+  req["count"] = huntCount;
+  size_t len = measureJson(req);
+  uint8_t *body = (uint8_t *)ps_malloc(len + 1);
+  if (body) serializeJson(req, (char *)body, len + 1);
+  if (!body || !startNetJob(JOB_HUNT, "/hunt", body, len, "application/json")) {
+    free(body);
+    huntUseFallback();
+    huntMsg = "No phone: using built-in clues";
+    huntBegin();
+  }
+}
+void handleHuntResult(bool parsed, JsonDocument &doc) {
+  int n = 0;
+  if (parsed && (doc["ok"] | false)) {
+    for (JsonObject c : doc["clues"].as<JsonArray>()) {
+      if (n >= huntCount) break;
+      huntClue[n] = (const char *)(c["clue"] | "");
+      huntSpot[n++] = (const char *)(c["spot"] | "");
+    }
+  }
+  if (n < huntCount) {
+    huntUseFallback();
+    huntMsg = parsed ? String("Claude said: ") + (const char *)(doc["error"] | "no clues") + " - built-in clues" : String("No phone: using built-in clues");
+  }
+  huntBegin();
+}
+void handleHuntQr(bool parsed, JsonDocument &doc) {
+  if (!parsed) return;
+  String text = (const char *)(doc["text"] | "");
+  if (!text.startsWith("CLAWD-HUNT:")) return;
+  if (!text.startsWith("CLAWD-HUNT:" + huntId + ":")) {
+    huntMsg = "That code is from another hunt";
+    return;
+  }
+  int i = text.substring(text.lastIndexOf(':') + 1).toInt();
+  if (i != huntIdx) {
+    huntMsg = "That's code #" + String(i + 1) + " - find #" + String(huntIdx + 1) + " first!";
+    return;
+  }
+  huntIdx++;
+  huntScanning = false;
+  huntCheerUntil = millis() + 1800;
+  pycamera.speaker_tone(1046, 60);
+  pycamera.speaker_tone(1568, 90);
+  petBoost(5);
+  if (huntIdx >= huntCount) {
+    huntTime = millis() - huntStart;
+    huntState = 5;
+    uint32_t best = prefs.getUInt("hunt_best", 0);
+    if (!best || huntTime / 1000 < best) prefs.putUInt("hunt_best", huntTime / 1000);
+  } else {
+    huntState = 3;
+    huntMsg = "";
+  }
+}
+void huntTool() {
+  unsigned long now = millis();
+  switch (huntState) {
+    case 0: // pick a theme and how many clues
+      if (pycamera.justPressed(AWEXP_BUTTON_UP)) huntThemeSel = (huntThemeSel + HUNT_THEME_COUNT - 1) % HUNT_THEME_COUNT;
+      if (pycamera.justPressed(AWEXP_BUTTON_DOWN)) huntThemeSel = (huntThemeSel + 1) % HUNT_THEME_COUNT;
+      if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) huntCount = max(3, huntCount - 1);
+      if (pycamera.justPressed(AWEXP_BUTTON_RIGHT)) huntCount = min(HUNT_MAX, huntCount + 1);
+      if (pycamera.justPressed(AWEXP_BUTTON_OK)) {
+        if (huntThemeSel == HUNT_THEME_COUNT - 1) {
+          if (waitNetIdle(4000)) {
+            listenPurpose = LP_HUNT;
+            if (startNetJob(JOB_LISTEN2, "/listen", NULL, 0, "")) huntState = 1;
+          }
+        } else {
+          huntTheme = HUNT_THEMES[huntThemeSel];
+          huntRequest();
+        }
+      }
+      break;
+    case 2: // show each QR code and where to hide it
+      if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) huntShow = (huntShow + huntCount - 1) % huntCount;
+      if (pycamera.justPressed(AWEXP_BUTTON_RIGHT)) huntShow = (huntShow + 1) % huntCount;
+      if (pycamera.justPressed(AWEXP_BUTTON_OK) || pycamera.justPressed(SHUTTER_BUTTON)) {
+        huntIdx = 0;
+        huntStart = now;
+        huntState = 3;
+        huntMsg = "";
+      }
+      break;
+    case 3: // read the clue, then scan
+      if (pycamera.justPressed(AWEXP_BUTTON_OK) || pycamera.justPressed(SHUTTER_BUTTON)) {
+        huntState = 4;
+        huntScanning = true;
+        huntMsg = "";
+      }
+      break;
+    case 4: // scanning with the camera (the phone reads the code)
+      if (pycamera.justPressed(AWEXP_BUTTON_LEFT)) {
+        huntState = 3;
+        huntScanning = false;
+      }
+      break;
+    case 5:
+      if (pycamera.justPressed(AWEXP_BUTTON_OK)) huntState = 0;
+      break;
+  }
+  if (huntState == 4) {
+    pycamera.captureFrame();
+    if (!netBusy() && pycamera.frame && now - lastHuntScan > 250) {
+      size_t len = pycamera.frame->len;
+      uint8_t *jpg = (uint8_t *)ps_malloc(len);
+      if (jpg) {
+        memcpy(jpg, pycamera.frame->buf, len);
+        if (startNetJob(JOB_QR, "/qr", jpg, len, "image/jpeg")) lastHuntScan = now;
+        else free(jpg);
+      }
+    }
+    PyCameraFB *fb = pycamera.fb;
+    drawCameraTitle(fb, ("Find code #" + String(huntIdx + 1) + " of " + String(huntCount)).c_str());
+    for (int k = 0; k < 3; k++) fb->drawRoundRect(50 - k, 50 - k, 140 + 2 * k, 140 + 2 * k, 10, CLAUDE_ORANGE);
+    drawCameraHint(fb, huntMsg.length() ? huntMsg : String("Point at the QR code   < back"), huntMsg.length() ? CLAUDE_AMBER : CLAUDE_CREAM);
+    pycamera.blitFrame();
+    return;
+  }
+  static unsigned long lastDraw = 0;
+  if (now - lastDraw < 66) return;
+  lastDraw = now;
+  ui->fillScreen(CLAUDE_DARK);
+  drawClaudeLogo(ui, 20, 18, 11, 0, CLAUDE_ORANGE);
+  ui->setTextSize(2);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(38, 11);
+  ui->print("Scavenger Hunt");
+  if (huntState == 0) {
+    for (int i = 0; i < HUNT_THEME_COUNT; i++) {
+      int y = 36 + i * 26;
+      bool sel = i == huntThemeSel;
+      if (sel) ui->fillRoundRect(10, y, 220, 22, 8, CLAUDE_ORANGE);
+      else ui->drawRoundRect(10, y, 220, 22, 8, CLAUDE_TRACK);
+      ui->setTextSize(1);
+      ui->setTextColor(sel ? CLAUDE_DARK : CLAUDE_CREAM);
+      ui->setCursor(20, y + 7);
+      ui->print(HUNT_THEMES[i]);
+    }
+    drawCentered(String("< ") + huntCount + " clues >", 198, 2, CLAUDE_ORANGE);
+    uint32_t best = prefs.getUInt("hunt_best", 0);
+    drawCentered(best ? "OK: Claude writes clues   best " + String(best / 60) + "m" + String(best % 60) + "s" : String("OK: Claude writes the clues"), 226, 1, CLAUDE_GRAY);
+  } else if (huntState == 1) {
+    drawClaudeLogo(ui, 120, 110, 26, now * 0.3f, CLAUDE_ORANGE);
+    drawCentered(listenPurpose == LP_HUNT && netJob == JOB_LISTEN2 ? "Say a theme to your phone..." : "Claude is writing riddles...", 160, 1, CLAUDE_CREAM);
+  } else if (huntState == 2) {
+    drawQrCode(huntCode(huntShow), 120, 104, 130);
+    drawCentered("Code #" + String(huntShow + 1) + " of " + String(huntCount) + ": hide it at", 176, 1, CLAUDE_GRAY);
+    drawCentered(huntSpot[huntShow], 190, 1, CLAUDE_ORANGE);
+    if (WiFi.status() == WL_CONNECTED) drawCentered("Print all: http://" + WiFi.localIP().toString() + "/hunt", 206, 1, CLAUDE_GRAY);
+    drawCentered("< > codes   OK: start the hunt", 226, 1, CLAUDE_GRAY);
+  } else if (huntState == 3) {
+    if (now < huntCheerUntil) { // confetti for the find
+      for (int k = 0; k < 40; k++) {
+        uint32_t h = k * 2654435761u;
+        int x = h % 240, y = ((h >> 8) % 240 + (now - huntCheerUntil + 1800) / 4) % 240;
+        ui->fillRect(x, y, 3, 3, k % 3 ? CLAUDE_ORANGE : CLAUDE_CREAM);
+      }
+      drawCentered("Found it!", 40, 2, CLAUDE_GREEN);
+    }
+    drawCentered("Clue " + String(huntIdx + 1) + " of " + String(huntCount), 64, 1, CLAUDE_GRAY);
+    String lines[6];
+    int n = wrapText(huntClue[huntIdx], 18, lines, 6);
+    for (int i = 0; i < n; i++) drawCentered(lines[i], 84 + i * 20, 2, CLAUDE_CREAM);
+    unsigned long t = (now - huntStart) / 1000;
+    drawCentered(String(t / 60) + ":" + (t % 60 < 10 ? "0" : "") + String(t % 60), 204, 1, CLAUDE_ORANGE);
+    drawCentered(huntMsg.length() ? huntMsg : String("Found the code? OK: scan it"), 226, 1, huntMsg.length() ? CLAUDE_AMBER : CLAUDE_GRAY);
+  } else if (huntState == 5) {
+    for (int k = 0; k < 60; k++) {
+      uint32_t h = k * 2654435761u;
+      ui->fillRect(h % 240, ((h >> 8) % 240 + now / 5) % 240, 3, 3, k % 3 ? CLAUDE_ORANGE : CLAUDE_AMBER);
+    }
+    drawBot(ui, 71, 90, 14, FACE_HAPPY, (now / 200) % 2 ? 2 : 1, (now / 200) % 2 ? 1 : 2);
+    drawCentered("Hunt complete!", 44, 2, CLAUDE_ORANGE);
+    unsigned long t = huntTime / 1000;
+    drawCentered(String(huntCount) + " clues in " + String(t / 60) + "m " + String(t % 60) + "s", 176, 2, CLAUDE_CREAM);
+    drawCentered("OK: new hunt", 226, 1, CLAUDE_GRAY);
+  }
+  if (huntMsg.length() && huntState == 2) drawCentered(huntMsg.substring(0, 38), 160, 1, CLAUDE_AMBER);
+  pushUi();
+}
+void handleListen2Result(bool parsed, JsonDocument &doc) {
+  String text = parsed && (doc["ok"] | false) ? String((const char *)(doc["text"] | "")) : String("");
+  String err = parsed ? String((const char *)(doc["error"] | "I didn't catch that")) : phoneError(netStatus);
+  if (listenPurpose == LP_BROWSER) {
+    if (text.length()) browserOpen(text, true);
+    else {
+      brError = err;
+      brState = brLineCount ? 2 : 0;
+    }
+  } else if (listenPurpose == LP_HUNT) {
+    if (text.length()) {
+      huntTheme = text;
+      huntRequest();
+    } else {
+      huntMsg = err;
+      huntState = 0;
+    }
+  }
+  listenPurpose = 0;
+}
+
+// ---- Music Player: MP3 and WAV files from the SD card, on the board's speaker ----
+// The speaker pin is driven as a 1-bit "PDM DAC" by the I2S peripheral, which is the closest
+// this chip gets to real audio out. Expect small-speaker sound: clear tunes, little bass.
+#define MUSIC_DIR "/music"
+#define MUSIC_MAX 60
+String musicFiles[MUSIC_MAX], musicError, musicPath;
+int musicCount = 0, musicSel = 0, musicNow = -1, musicVolume = 3; // volume 1-4
+volatile bool musicPlaying = false, musicPaused = false, musicStopReq = false, musicEnded = false;
+volatile int musicPeak = 0;
+volatile uint32_t musicSamples = 0, musicRate = 22050;
+TaskHandle_t musicTaskHandle = NULL;
+i2s_chan_handle_t musicTx = NULL;
+bool musicScanned = false;
+bool hasExt(const String &name, const char *ext) {
+  String n = name;
+  n.toLowerCase();
+  return n.endsWith(ext);
+}
+void musicScan() {
+  musicCount = 0;
+  musicScanned = true;
+  if (!pycamera.sd.exists(MUSIC_DIR)) pycamera.sd.mkdir(MUSIC_DIR);
+  File dir = pycamera.sd.open(MUSIC_DIR);
+  if (!dir) return;
+  File f;
+  char name[96];
+  while (musicCount < MUSIC_MAX && f.openNext(&dir, O_RDONLY)) {
+    f.getName(name, sizeof(name));
+    String n = name;
+    if (!f.isDir() && (hasExt(n, ".mp3") || hasExt(n, ".wav")) && !n.startsWith(".")) musicFiles[musicCount++] = n;
+    f.close();
+  }
+  dir.close();
+  for (int i = 1; i < musicCount; i++) // alphabetical
+    for (int j = i; j > 0 && musicFiles[j] < musicFiles[j - 1]; j--) {
+      String t = musicFiles[j];
+      musicFiles[j] = musicFiles[j - 1];
+      musicFiles[j - 1] = t;
+    }
+}
+bool musicOutStart(uint32_t rate) {
+  stopDance();
+  noTone(BOARD_SPEAKER_PIN); // the beeps use the same pin; take it over
+  delay(20);
+  ledcDetach(BOARD_SPEAKER_PIN);
+  i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  cc.auto_clear = true;
+  if (i2s_new_channel(&cc, &musicTx, NULL) != ESP_OK) return false;
+  i2s_pdm_tx_config_t cfg = {};
+  i2s_pdm_tx_clk_config_t clk = I2S_PDM_TX_CLK_DAC_DEFAULT_CONFIG(rate);
+  i2s_pdm_tx_slot_config_t slot = I2S_PDM_TX_SLOT_DAC_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+  cfg.clk_cfg = clk;
+  cfg.slot_cfg = slot;
+  cfg.gpio_cfg.clk = I2S_GPIO_UNUSED;
+  cfg.gpio_cfg.dout = (gpio_num_t)BOARD_SPEAKER_PIN;
+#if SOC_I2S_PDM_MAX_TX_LINES > 1
+  cfg.gpio_cfg.dout2 = I2S_GPIO_UNUSED;
+#endif
+  if (i2s_channel_init_pdm_tx_mode(musicTx, &cfg) != ESP_OK || i2s_channel_enable(musicTx) != ESP_OK) {
+    i2s_del_channel(musicTx);
+    musicTx = NULL;
+    return false;
+  }
+  musicRate = rate;
+  pycamera.aw.digitalWrite(AWEXP_SPKR_SD, HIGH); // un-mute
+  return true;
+}
+void musicSetRate(uint32_t rate) {
+  if (!musicTx || rate == musicRate || rate < 8000 || rate > 48000) return;
+  i2s_channel_disable(musicTx);
+  i2s_pdm_tx_clk_config_t clk = I2S_PDM_TX_CLK_DAC_DEFAULT_CONFIG(rate);
+  i2s_channel_reconfig_pdm_tx_clock(musicTx, &clk);
+  i2s_channel_enable(musicTx);
+  musicRate = rate;
+}
+void musicOutStop() {
+  if (musicTx) {
+    i2s_channel_disable(musicTx);
+    i2s_del_channel(musicTx);
+    musicTx = NULL;
+  }
+  gpio_reset_pin((gpio_num_t)BOARD_SPEAKER_PIN);
+  pycamera.aw.digitalWrite(AWEXP_SPKR_SD, LOW);
+}
+// Volume, peak meter, then out to the speaker. Returns false when asked to stop.
+bool musicWrite(int16_t *pcm, int n) {
+  while (musicPaused && !musicStopReq) vTaskDelay(pdMS_TO_TICKS(20));
+  if (musicStopReq) return false;
+  int peak = 0;
+  for (int i = 0; i < n; i++) {
+    int s = pcm[i] * musicVolume / 4;
+    pcm[i] = s;
+    peak = max(peak, abs(s));
+  }
+  musicPeak = peak;
+  size_t written;
+  i2s_channel_write(musicTx, pcm, n * 2, &written, portMAX_DELAY);
+  musicSamples += n;
+  return true;
+}
+void musicPlayWav(File &f, int16_t *pcm, uint8_t *raw) {
+  uint8_t hdr[12];
+  if (f.read(hdr, 12) != 12 || memcmp(hdr, "RIFF", 4) || memcmp(hdr + 8, "WAVE", 4)) return;
+  int channels = 1, bits = 16;
+  uint32_t rate = 22050;
+  while (f.available()) { // walk the chunks to "fmt " and "data"
+    uint8_t ch[8];
+    if (f.read(ch, 8) != 8) return;
+    uint32_t size = ch[4] | ch[5] << 8 | ch[6] << 16 | (uint32_t)ch[7] << 24;
+    if (!memcmp(ch, "fmt ", 4)) {
+      uint8_t fmt[16];
+      f.read(fmt, 16);
+      channels = fmt[2];
+      rate = fmt[4] | fmt[5] << 8 | fmt[6] << 16;
+      bits = fmt[14];
+      if (size > 16) f.seekCur(size - 16);
+    } else if (!memcmp(ch, "data", 4)) {
+      break;
+    } else {
+      f.seekCur(size + (size & 1));
+    }
+  }
+  if ((bits != 8 && bits != 16) || channels < 1 || channels > 2) return;
+  musicSetRate(rate);
+  int frameBytes = channels * bits / 8;
+  while (true) {
+    int got = f.read(raw, 1024 * frameBytes);
+    int frames = got / frameBytes;
+    if (frames <= 0) return;
+    for (int i = 0; i < frames; i++) { // to 16-bit mono
+      int32_t s = 0;
+      for (int c = 0; c < channels; c++)
+        s += bits == 16 ? (int16_t)(raw[(i * channels + c) * 2] | raw[(i * channels + c) * 2 + 1] << 8)
+                        : ((int)raw[i * channels + c] - 128) << 8;
+      pcm[i] = s / channels;
+    }
+    if (!musicWrite(pcm, frames)) return;
+  }
+}
+void musicPlayMp3(File &f, int16_t *pcm, uint8_t *in) {
+  HMP3Decoder dec = MP3InitDecoder();
+  if (!dec) return;
+  uint8_t id3[10];
+  if (f.read(id3, 10) == 10 && !memcmp(id3, "ID3", 3)) { // skip the ID3v2 tag
+    uint32_t size = (id3[6] & 0x7F) << 21 | (id3[7] & 0x7F) << 14 | (id3[8] & 0x7F) << 7 | (id3[9] & 0x7F);
+    f.seekSet(10 + size);
+  } else {
+    f.seekSet(0);
+  }
+  int left = 0;
+  uint8_t *ptr = in;
+  int16_t stereo[1152 * 2];
+  while (true) {
+    if (left < 2048) { // top up the input buffer
+      memmove(in, ptr, left);
+      int got = f.read(in + left, 4096 - left);
+      if (got > 0) left += got;
+      ptr = in;
+      if (left <= 0) break;
+    }
+    int off = MP3FindSyncWord(ptr, left);
+    if (off < 0) {
+      left = 0;
+      continue;
+    }
+    ptr += off;
+    left -= off;
+    int err = MP3Decode(dec, &ptr, &left, stereo, 0);
+    if (err == ERR_MP3_INDATA_UNDERFLOW || err == ERR_MP3_MAINDATA_UNDERFLOW) {
+      if (!f.available()) break;
+      continue;
+    }
+    if (err) { // corrupt frame: skip a byte and resync
+      if (left > 0) {
+        ptr++;
+        left--;
+      }
+      continue;
+    }
+    MP3FrameInfo info;
+    MP3GetLastFrameInfo(dec, &info);
+    musicSetRate(info.samprate);
+    int frames = info.outputSamps / max(1, info.nChans);
+    for (int i = 0; i < frames; i++) pcm[i] = info.nChans == 2 ? (stereo[i * 2] + stereo[i * 2 + 1]) / 2 : stereo[i];
+    if (!musicWrite(pcm, frames)) break;
+  }
+  MP3FreeDecoder(dec);
+}
+void musicTask(void *) {
+  int16_t *pcm = (int16_t *)malloc(1152 * sizeof(int16_t) * 2);
+  uint8_t *buf = (uint8_t *)malloc(4096);
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    File f = pycamera.sd.open(musicPath.c_str(), FILE_READ);
+    if (f && pcm && buf) {
+      musicSamples = 0;
+      if (hasExt(musicPath, ".wav")) musicPlayWav(f, pcm, buf);
+      else musicPlayMp3(f, pcm, buf);
+    }
+    f.close();
+    musicEnded = !musicStopReq;
+    musicPlaying = false;
+  }
+}
+void musicPlay(int i) {
+  musicStop();
+  if (i < 0 || i >= musicCount) return;
+  if (!musicTx && !musicOutStart(22050)) {
+    musicError = "Couldn't start the speaker";
+    return;
+  }
+  if (!musicTaskHandle) xTaskCreatePinnedToCore(musicTask, "music", 12288, NULL, 2, &musicTaskHandle, 0);
+  musicNow = i;
+  musicPath = String(MUSIC_DIR) + "/" + musicFiles[i];
+  musicStopReq = false;
+  musicPaused = false;
+  musicEnded = false;
+  musicPlaying = true;
+  musicError = "";
+  xTaskNotifyGive(musicTaskHandle);
+}
+void musicStop() {
+  if (musicPlaying) {
+    musicStopReq = true;
+    musicPaused = false;
+    unsigned long t = millis();
+    while (musicPlaying && millis() - t < 1000) delay(5);
+  }
+  if (musicTx) musicOutStop();
+}
+void musicMode() {
+  if (!musicScanned) musicScan();
+  if (musicEnded) { // next track
+    musicEnded = false;
+    if (musicCount) musicPlay((musicNow + 1) % musicCount);
+  }
+  if (pycamera.justPressed(AWEXP_BUTTON_UP) && musicCount) musicSel = (musicSel + musicCount - 1) % musicCount;
+  if (pycamera.justPressed(AWEXP_BUTTON_DOWN) && musicCount) musicSel = (musicSel + 1) % musicCount;
+  if (pycamera.justPressed(AWEXP_BUTTON_OK) && musicCount) {
+    if (musicPlaying && musicSel == musicNow) musicPaused = !musicPaused;
+    else musicPlay(musicSel);
+  }
+  if (pycamera.justPressed(AWEXP_BUTTON_RIGHT) && musicCount) musicPlay(musicSel = (max(0, musicNow) + 1) % musicCount);
+  if (pycamera.justPressed(AWEXP_BUTTON_LEFT) && musicCount) musicPlay(musicSel = (max(0, musicNow) + musicCount - 1) % musicCount);
+  if (pycamera.justPressed(SHUTTER_BUTTON)) musicVolume = musicVolume % 4 + 1;
+  static unsigned long lastDraw = 0;
+  unsigned long now = millis();
+  if (now - lastDraw < 50) return;
+  lastDraw = now;
+  ui->fillScreen(CLAUDE_DARK);
+  drawClaudeLogo(ui, 20, 18, 11, musicPlaying && !musicPaused ? now * 0.2f : 0, CLAUDE_ORANGE);
+  ui->setTextSize(2);
+  ui->setTextColor(CLAUDE_CREAM);
+  ui->setCursor(38, 11);
+  ui->print("Music");
+  for (int v = 0; v < 4; v++) ui->fillRect(196 + v * 8, 22 - v * 4, 5, 4 + v * 4, v < musicVolume ? CLAUDE_ORANGE : CLAUDE_TRACK);
+  if (!musicCount) {
+    drawMusicNote(108, 110, 2, CLAUDE_TRACK);
+    drawCentered("Put .mp3 or .wav files in", 140, 1, CLAUDE_CREAM);
+    drawCentered("/music on the SD card", 152, 1, CLAUDE_ORANGE);
+    drawCentered("Mono, 22-44 kHz plays best", 170, 1, CLAUDE_GRAY);
+    if (pycamera.justPressed(AWEXP_BUTTON_OK)) musicScan();
+    pushUi();
+    return;
+  }
+  // now playing: Clawd bobs to the loudness, with a level meter
+  bool live = musicPlaying && !musicPaused;
+  int level = live ? min(100, musicPeak * 100 / 20000) : 0;
+  drawBot(ui, 16, 48 - level / 12, 6, live ? FACE_HAPPY : FACE_BLINK, level > 50 ? 2 : 1, level > 70 ? 2 : 0);
+  for (int b = 0; b < 12; b++) {
+    int h = live ? max(2, (int)(level * (0.4f + 0.6f * fabsf(sinf(now / 90.0f + b * 1.3f))) * 40 / 100)) : 2;
+    ui->fillRect(78 + b * 13, 80 - h, 9, h, b < 8 ? CLAUDE_ORANGE : b < 10 ? CLAUDE_AMBER : CLAUDE_RED);
+  }
+  if (musicNow >= 0) {
+    String t = musicFiles[musicNow];
+    t = t.substring(0, t.lastIndexOf('.'));
+    if (t.length() > 38) t = t.substring(0, 37) + ".";
+    drawCentered(t, 88, 1, musicPaused ? CLAUDE_GRAY : CLAUDE_CREAM);
+    uint32_t secs = musicSamples / max((uint32_t)1, (uint32_t)musicRate);
+    drawCentered(String(musicPaused ? "paused " : "") + String(secs / 60) + ":" + (secs % 60 < 10 ? "0" : "") + String(secs % 60), 100, 1, CLAUDE_GRAY);
+  }
+  int first = constrain(musicSel - 3, 0, max(0, musicCount - 7));
+  for (int i = first; i < first + 7 && i < musicCount; i++) {
+    int y = 114 + (i - first) * 15;
+    if (i == musicSel) ui->fillRoundRect(4, y - 2, 232, 13, 4, CLAUDE_ORANGE);
+    ui->setTextSize(1);
+    ui->setTextColor(i == musicSel ? CLAUDE_DARK : i == musicNow ? CLAUDE_ORANGE : CLAUDE_CREAM);
+    ui->setCursor(10, y);
+    String n = musicFiles[i];
+    ui->print(n.length() > 37 ? n.substring(0, 36) + "." : n);
+  }
+  if (musicError.length()) drawCentered(musicError, 214, 1, CLAUDE_RED);
+  drawCentered("OK play/pause  < > track  Shutter vol", 228, 1, CLAUDE_GRAY);
+  pushUi();
+}
+
+// ---- Web pages for Retro Cam photos and the hunt's printable QR codes ----
+String qrSvgOut;
+void qrToSvg(esp_qrcode_handle_t q) {
+  int n = esp_qrcode_get_size(q);
+  qrSvgOut = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='-2 -2 " + String(n + 4) + " " + String(n + 4) +
+             "' width='200' height='200' shape-rendering='crispEdges'><rect x='-2' y='-2' width='100%' height='100%' fill='#fff'/><path d='";
+  for (int y = 0; y < n; y++)
+    for (int x = 0; x < n; x++)
+      if (esp_qrcode_get_module(q, x, y)) qrSvgOut += "M" + String(x) + " " + String(y) + "h1v1h-1z";
+  qrSvgOut += "'/></svg>";
+}
+String qrSvg(const String &text) {
+  qrSvgOut = "";
+  esp_qrcode_config_t cfg = {qrToSvg, 10, ESP_QRCODE_ECC_LOW};
+  esp_qrcode_generate(&cfg, text.c_str());
+  return qrSvgOut;
+}
+void webStreamFile(WiFiClient &c, const String &path) {
+  File f = pycamera.sd.open(path.c_str(), FILE_READ);
+  if (!f) {
+    webReply(c, 404, "text/plain", "not found");
+    return;
+  }
+  c.printf("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+           hasExt(path, ".gif") ? "image/gif" : "image/jpeg", (unsigned long)f.size());
+  uint8_t buf[1024];
+  int n;
+  while ((n = f.read(buf, sizeof(buf))) > 0) c.write(buf, n);
+  f.close();
+}
+// Extra routes for the web remote; returns true if it answered
+bool webExtraRoute(WiFiClient &c, const String &path, const String &query) {
+  if (path == "/rc") {
+    String name = queryArg(query, "f");
+    if (!name.length() || name.indexOf('/') >= 0 || name.indexOf("..") >= 0) webReply(c, 400, "text/plain", "bad name");
+    else webStreamFile(c, "/retrocam/" + name);
+    return true;
+  }
+  if (path == "/gallery") {
+    String html = "<!doctype html><meta name=viewport content='width=device-width'><title>Retro Cam</title>"
+                  "<body style='background:#141413;color:#faf9f5;font-family:sans-serif'><h2 style='color:#d97757'>Retro Cam</h2>";
+    File dir = pycamera.sd.open("/retrocam");
+    File f;
+    char name[48];
+    int shown = 0;
+    while (dir && shown < 60 && f.openNext(&dir, O_RDONLY)) {
+      f.getName(name, sizeof(name));
+      f.close();
+      if (!hasExt(name, ".jpg") && !hasExt(name, ".gif")) continue;
+      html += "<a href='/rc?f=" + String(name) + "'><img src='/rc?f=" + String(name) +
+              "' width=160 style='image-rendering:pixelated;margin:4px;border-radius:6px'></a>";
+      shown++;
+    }
+    dir.close();
+    if (!shown) html += "<p>No photos yet. Take some in Retro Cam!</p>";
+    webReply(c, 200, "text/html", (html + "</body>").c_str());
+    return true;
+  }
+  if (path == "/hunt") {
+    String html = "<!doctype html><meta name=viewport content='width=device-width'><title>Scavenger Hunt codes</title>"
+                  "<body style='font-family:sans-serif'><h2>Scavenger Hunt: print, cut out, hide</h2>";
+    if (!huntId.length()) html += "<p>Start a hunt on the board first (Toolbox &gt; Scavenger Hunt).</p>";
+    for (int i = 0; huntId.length() && i < huntCount; i++)
+      html += "<div style='display:inline-block;margin:10px;text-align:center;border:1px dashed #999;padding:8px'>" + qrSvg(huntCode(i)) +
+              "<br><b>#" + String(i + 1) + "</b><br><small>hide at: " + huntSpot[i] + "</small></div>";
+    webReply(c, 200, "text/html", (html + "</body>").c_str());
+    return true;
+  }
+  return false;
+}
+// Called when you leave a screen with SEL: stop anything running in the Fun Lab
+void leaveFunLab() {
+  if (rcGifFrames) {
+    gifEnd();
+    rcGifFrames = 0;
+  }
+  musicStop();
+  duelLobby = false;
+  huntScanning = false;
 }
 
 // ===================== BOOT QUOTE =====================
@@ -5092,11 +7131,18 @@ bool canSleepNow() {
       return askState != ASK_THINKING;
     case MODE_TALK:
       return talkState == TALK_IDLE || talkState == TALK_ANSWER;
-    case MODE_GAME:           // Tilt Catch is played without buttons
-      return !(currentGame == GAME_TILT && !gameOver);
+    case MODE_GAME:           // Tilt Catch is played without buttons; Beats and Duel run on their own
+      return gameOver || (currentGame != GAME_TILT && currentGame != GAME_BEATS && currentGame != GAME_DUEL);
     case MODE_TOOL:           // hands-free tools, a running timer, or a recording
       return !((currentTool == TOOL_POMODORO && pomoRunning) || currentTool == TOOL_LEVEL || currentTool == TOOL_QR ||
-               currentTool == TOOL_REMOTE || (currentTool == TOOL_TIMELAPSE && tlState != 0));
+               currentTool == TOOL_REMOTE || (currentTool == TOOL_TIMELAPSE && tlState != 0) || currentTool == TOOL_AI ||
+               (currentTool == TOOL_HUNT && (huntState == 3 || huntState == 4)));
+    case MODE_MUSIC:
+      return !musicPlaying;
+    case MODE_NOWPLAY:        // a little dashboard: keep it on
+      return false;
+    case MODE_RETRO:
+      return !rcGifFrames;
     default:
       return true;
   }
@@ -5303,6 +7349,7 @@ void loop() {
   petTick();
   talkTick();
   webTick();
+  friendsTick();
   static unsigned long lastEventCheck = 0;
   if (millis() - lastEventCheck > 1000) { // Telegram reminders, in every mode
     lastEventCheck = millis();
@@ -5323,6 +7370,7 @@ void loop() {
   if (pycamera.justPressed(AWEXP_BUTTON_SEL)) {
     if (currentMode != MODE_MENU) {
       stopDance();
+      leaveFunLab();
       currentMode = MODE_MENU;
       menuSelection = 0;
       drawMenu();
@@ -5380,6 +7428,21 @@ void loop() {
     case MODE_SLEEP:
       sleepMode();
       break;
+    case MODE_RETRO:
+      retroMode();
+      break;
+    case MODE_NOWPLAY:
+      nowPlayingMode();
+      break;
+    case MODE_BROWSER:
+      browserMode();
+      break;
+    case MODE_MUSIC:
+      musicMode();
+      break;
+    case MODE_FRIENDS:
+      friendsMode();
+      break;
     default:
       // Idle: perhaps live preview
       pycamera.captureFrame();
@@ -5436,10 +7499,15 @@ void handleMenuNavigation() {
       case 6: currentMode = MODE_FACE; break;
       case 7: currentMode = MODE_WORLD; feedMode = false; break;
       case 8: currentMode = MODE_WORLD; feedMode = true; break;
-      case 9: currentMode = MODE_GAME_MENU; break;
-      case 10: currentMode = MODE_TOOLS; break;
-      case 11: currentMode = MODE_CAMERA; break;
-      case 12: currentMode = MODE_HOME_ASSISTANT; break;
+      case 9: currentMode = MODE_RETRO; rcShare = false; break;
+      case 10: currentMode = MODE_NOWPLAY; npPollAt = 0; break;
+      case 11: currentMode = MODE_BROWSER; break;
+      case 12: currentMode = MODE_MUSIC; musicScanned = false; break;
+      case 13: currentMode = MODE_FRIENDS; chatWith = -1; break;
+      case 14: currentMode = MODE_GAME_MENU; break;
+      case 15: currentMode = MODE_TOOLS; break;
+      case 16: currentMode = MODE_CAMERA; break;
+      case 17: currentMode = MODE_HOME_ASSISTANT; break;
     }
   }
 }

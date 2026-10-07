@@ -12,8 +12,8 @@ android {
         applicationId = "com.vikas.clawdhandy"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.2"
         // Phones are ARM; leaving out the x86 emulator copies of ML Kit's native code halves the APK
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
@@ -44,5 +44,6 @@ dependencies {
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
     implementation("com.google.mlkit:face-detection:16.1.7")
     implementation("com.google.android.gms:play-services-tasks:18.2.0")
+    implementation("org.jsoup:jsoup:1.18.3")
     testImplementation("junit:junit:4.13.2")
 }

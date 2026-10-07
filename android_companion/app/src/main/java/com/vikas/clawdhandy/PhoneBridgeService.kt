@@ -47,6 +47,10 @@ import java.util.concurrent.TimeUnit
  *   POST /ask/text   {prompt, mode, lang, source}   ask / translate / note
  *   POST /ask/image?mode=look|translate&lang=..     body = JPEG
  *   POST /face, /qr                   body = JPEG, found on the phone with ML Kit
+ *   GET  /nowplaying                  what's playing on the phone; /nowplaying/art = 120x120 JPEG
+ *   POST /media?action=play_pause|next|previous|volume_up|volume_down
+ *   POST /browse     {input}          a web page (or DuckDuckGo search) as text + links
+ *   POST /hunt       {theme, count}   scavenger hunt clues written by Claude
  *   GET  /pair                        the pairing token, only while pairing is open
  *
  * Every other request needs the pairing token in X-Clawd-Token. The board finds the phone by
@@ -241,6 +245,16 @@ class PhoneBridgeService : Service() {
                     method == "POST" && path == "/ask/image" -> askImage(body, query)
                     method == "POST" && path == "/face" -> findFaces(body)
                     method == "POST" && path == "/qr" -> readQr(body)
+                    method == "GET" && path == "/nowplaying" -> NowPlaying.current(this)
+                    method == "GET" && path == "/nowplaying/art" -> {
+                        val jpeg = NowPlaying.artJpeg(this, 120) ?: return respond(output, 404, error("No album art"))
+                        return respondBytes(output, "image/jpeg", jpeg)
+                    }
+                    method == "POST" && path == "/media" ->
+                        JSONObject().put("ok", true).put("answer", NowPlaying.control(this, query["action"] ?: "play_pause"))
+                    method == "POST" && path == "/browse" ->
+                        PhoneBrowser.open(JSONObject(String(body, Charsets.UTF_8)).optString("input"))
+                    method == "POST" && path == "/hunt" -> hunt(body)
                     else -> return respond(output, 404, error("Unknown endpoint $path"))
                 }
                 respond(output, 200, response)
@@ -364,6 +378,12 @@ class PhoneBridgeService : Service() {
         }
     }
 
+    private fun hunt(body: ByteArray): JSONObject {
+        val request = JSONObject(String(body, Charsets.UTF_8))
+        val reply = Brain.get(this).hunt(request.optString("theme"), request.optInt("count", 5))
+        return if (reply.ok) JSONObject().put("ok", true).put("clues", JSONArray(reply.answer)) else error(reply.answer)
+    }
+
     // ------------------------------------------------------------------ tiny HTTP helpers
 
     private fun error(message: String): JSONObject = JSONObject().put("ok", false).put("error", message).put("answer", message)
@@ -382,6 +402,15 @@ class PhoneBridgeService : Service() {
         output.write(
             ("HTTP/1.1 $status $reason\r\nContent-Type: application/json; charset=utf-8\r\n" +
                 "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray(Charsets.US_ASCII)
+        )
+        output.write(body)
+        output.flush()
+    }
+
+    private fun respondBytes(output: BufferedOutputStream, type: String, body: ByteArray) {
+        output.write(
+            ("HTTP/1.1 200 OK\r\nContent-Type: $type\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n")
+                .toByteArray(Charsets.US_ASCII)
         )
         output.write(body)
         output.flush()

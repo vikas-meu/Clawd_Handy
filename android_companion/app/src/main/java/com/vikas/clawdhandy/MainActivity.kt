@@ -435,6 +435,9 @@ class MainActivity : Activity() {
                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
             }
         }
+        setupRow("Now Playing on the handheld", NowPlaying.allowed(this), "Allow") {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
         setupRow("Open apps from the handheld", Settings.canDrawOverlays(this), "Allow") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         }

@@ -13,6 +13,16 @@ Press the shutter and talk: it answers, searches the web, translates, sets your 
 
 <p align="center"><img src="docs/screens.png" alt="Six screens: Clawd Talk answer, listening, menu, Clawd Pet, idle clock, alarm"></p>
 
+## What's new in 2.2
+
+- **Retro Cam:** Game Boy Camera-style photos (4 greens, dithered), plus 1-bit, pixel art, ASCII, glitch, thermal and sketch filters. Save photos and 12-frame animated GIFs to the SD card, then scan a QR code to download them on your phone (or browse `http://clawd.local/gallery`).
+- **Now Playing:** what's playing on your phone, with album art, a progress bar and play/pause, skip and volume buttons.
+- **Browser:** the web as text, Lynx-style. Say a site or a search into your phone; the phone fetches and simplifies the page, and the board shows the text and links.
+- **Music:** MP3 and WAV files from the SD card's `/music` folder on the board's speaker, with a level meter and Clawd bopping along.
+- **Friends:** boards running Clawd Handy on the same WiFi find each other over ESP-NOW (direct radio), swap names and pet stats, wave and chat with quick messages.
+- **Games:** **Clawd Beats** (a rhythm game on the dance music) and **Pong Duel** (two boards, one paddle each).
+- **Toolbox:** **Person Detector**, a neural network that runs on the board itself with no internet, and **Scavenger Hunt**, where Claude writes riddles and you hide printable QR codes for friends to find.
+
 ## What's new in 2.1
 
 - **Daily Feed**, a new menu: your **YouTube subscriber count** (with confetti when it goes up), crypto, exchange rates, Hacker News, on this day in history, a random Wikipedia article, a trivia quiz and a joke.
@@ -40,8 +50,13 @@ Press the shutter and talk: it answers, searches the web, translates, sets your 
 | 🙂 | **Face Finder** | Live camera with boxes around faces. Clawd follows the first face with its eyes and waves at newcomers. |
 | 🌍 | **World Live** | Location and space, 8 pages: weather from your phone's GPS (it follows you around), air quality, sunrise/sunset and tonight's moon, planes overhead on a radar, the ISS on a world map, space weather and aurora chances, the next rocket launches with a countdown, and recent earthquakes. |
 | 📰 | **Daily Feed** | 8 pages: your YouTube channel's subscribers, views and videos (confetti when they go up), crypto prices, exchange rates in your currency, the Hacker News front page, a slice of history from today's date, a random Wikipedia article, a trivia quiz that keeps score, and a joke with a punchline on OK. |
-| 🎮 | **Games** | Flappy Clawd, Block Drop, 2048, and Tilt Catch (steered with the accelerometer). Best scores are saved. |
-| 🧰 | **Toolbox** | Pomodoro timer, spirit level, 3-2-1 photo booth, timelapse with flipbook playback, QR scanner, smart-home buttons, and a web remote. |
+| 🎮 | **Games** | Flappy Clawd, Block Drop, 2048, Tilt Catch (steered with the accelerometer), Clawd Beats (rhythm) and Pong Duel (two boards). Best scores are saved. |
+| 📸 | **Retro Cam** | Game Boy Camera look and 7 more live filters. Shutter saves a photo, OK records a 12-frame GIF, UP shows a QR code to download it. |
+| 🎵 | **Now Playing** | Your phone's music with album art and controls. |
+| 🌐 | **Browser** | Web pages and searches as readable text with selectable links, fetched by the phone. |
+| 🔊 | **Music** | MP3/WAV from the SD card on the speaker. |
+| 👋 | **Friends** | Other Clawds nearby: names, pet stats, waves and quick chat over ESP-NOW. |
+| 🧰 | **Toolbox** | Pomodoro timer, spirit level, 3-2-1 photo booth, timelapse with flipbook playback, QR scanner, smart-home buttons, a web remote, an on-board **Person Detector** and a **Scavenger Hunt**. |
 | 🌙 | **Idle clock** | After 40 s without a button press the screen dims to a clock with Clawd asleep in a nightcap, plus your next alarm and the phone's battery. |
 
 Everything from the original sketch is still there: Telegram bot, motion-triggered security photos, the camera mode, and I2C commands to two helper Arduinos.
@@ -55,7 +70,7 @@ The Android app in [`android_companion/`](android_companion/) is the board's ear
 - **Where you are**: the live GPS fix the board uses, with a nearby map.
 - **Journal**: everything you asked, from the handheld or the phone.
 - **Notes & reminders**: written by you, or by Clawd when you ask.
-- **Setup checklist**: API key, microphone, location, notifications, and permission to open apps from the handheld.
+- **Setup checklist**: API key, microphone, location, notifications, notification access (for Now Playing), and permission to open apps from the handheld.
 
 ## How it works
 
@@ -200,7 +215,13 @@ Once the board knows the time, it keeps counting on its own. The time is also sa
 | Alarms | **▲▼** pick · **OK** edit · **▶** on/off. While editing: **◀ ▶** field, **▲▼** change (hold to scroll), **OK** save |
 | Alarm ringing | **OK** stop · any other key or a **shake** snoozes 5 min |
 | World Live / Daily Feed | **◀ ▶** page · **OK** refresh. Trivia: **▲▼** pick, **OK** answer, **OK** next · Joke: **OK** punchline, **OK** next · On this day: **▲▼** more events · Wikipedia: **▲▼** scroll, **OK** another |
-| Games | Flappy: **OK** flap · Blocks: **◀ ▶** move, **▲** turn, **▼** faster, **Shutter** drop · 2048: D-pad · Tilt Catch: tilt the board |
+| Games | Flappy: **OK** flap · Blocks: **◀ ▶** move, **▲** turn, **▼** faster, **Shutter** drop · 2048: D-pad · Tilt Catch: tilt the board · Beats: **◀ ▲ ▶** on the beat (OK works for ▲) · Pong Duel: **▲▼** paddle |
+| Retro Cam | **◀ ▶** filter · **Shutter** photo · **OK** GIF · **▲** share the last one as a QR code |
+| Now Playing | **OK** play/pause · **◀ ▶** previous/next · **▲▼** volume |
+| Browser | **Shutter** speak a site or search · Home: **▲▼** pick, **OK** open · Page: **▲▼** scroll, **OK** links, **◀** back |
+| Music | **▲▼** pick · **OK** play/pause · **◀ ▶** track · **Shutter** volume |
+| Friends | **▲▼** pick · **OK** chat · **▶** wave · In chat: **▲▼** message, **OK** send, **◀** back |
+| Scavenger Hunt | **▲▼** theme · **◀ ▶** number of clues · **OK** go. Then hide the codes, and **OK** scans a found one |
 
 ## Settings worth knowing
 
@@ -215,6 +236,7 @@ Once the board knows the time, it keeps counting on its own. The time is also sa
 | `SONGS[]` | 3 songs | Add your own: one drum bar plus bass and chord patterns over 4 chords |
 | `YT_HANDLE`, `YT_API_KEY` in YOUR SETTINGS | placeholders | Your channel (e.g. `@vikas`) and a free YouTube Data API key, for the YouTube page |
 | `HOME_CURRENCY` in YOUR SETTINGS | `INR` | The currency the exchange rates are shown in |
+| `CLAWD_NAME` in YOUR SETTINGS | `""` (Clawd-XXXX) | Your Clawd's name as Friends see it |
 | `MODEL` in `Brain.kt` | `claude-opus-5-5` | The Claude model the phone uses (at low effort, for quick answers) |
 | Phone app, Setup card | on | Speak answers out loud on the phone |
 
@@ -229,6 +251,9 @@ Once the board knows the time, it keeps counting on its own. The time is also sa
 - **Talk or Ask says to add an API key:** add it in the app's Setup card. API use is billed separately from a Claude plan.
 - **Planes page says "Too many requests":** OpenSky allows about 400 anonymous requests a day. The page only refreshes while it's on screen. Launches have a similar limit (15 an hour), so that page refreshes every 30 minutes.
 - **YouTube page says to add a key:** in [Google Cloud Console](https://console.cloud.google.com), create a project, enable **YouTube Data API v3**, and under **Credentials** create an API key. Put it in `YT_API_KEY` and your handle in `YT_HANDLE`. It's free; the board uses about 300 of the 10,000 daily quota units. YouTube rounds counts above 1,000 to three significant figures, so the number moves in steps.
+- **Now Playing says to allow notification access:** in the app's Setup card, tap **Now Playing on the handheld** and switch Clawd Phone on. Android only shares what's playing with apps you allow.
+- **Friends never shows anyone:** both boards need to be on the same WiFi (same channel). ESP-NOW doesn't reach across different routers.
+- **Music sounds thin:** that's the tiny speaker and the 1-bit PDM output. Mono files at 22-44 kHz sound best.
 - **Stuck on boot without an SD card:** the original sketch waits for an SD card. Insert one.
 - **Building it yourself:** don't add the ESP32 `WebServer` library. It pulls in `FS.h`, which makes SdFat stop defining `File` and breaks the camera library's `takePhoto()`. The web remote uses a tiny server built on `WiFiServer` instead.
 
@@ -237,6 +262,7 @@ Once the board knows the time, it keeps counting on its own. The time is also sa
 ```
 claude_desk_buddy/
   claude_desk_buddy.ino   the whole board firmware
+  person_model.h          the Person Detector's neural network (TensorFlow Lite Micro, Apache 2.0)
 tools/
   private_values.py       git filter that keeps the sketch's "// private" values out of commits
 android_companion/        the Clawd Phone app (Kotlin, no XML layouts)
@@ -246,6 +272,8 @@ android_companion/        the Clawd Phone app (Kotlin, no XML layouts)
     Voice.kt              push-to-talk listening and spoken answers
     PhoneLocation.kt      GPS fixes and city names
     PhoneActions.kt       media keys, maps, music, dialer, reminders
+    NowPlaying.kt         what's playing on the phone, album art and controls
+    PhoneBrowser.kt       fetches web pages and keeps the readable text and links
     MainActivity.kt       the app screen
 docs/
   make_images.py          redraws boot.gif, dance.gif and screens.png from the sketch's drawing code
@@ -255,3 +283,5 @@ docs/
 ## License
 
 GPL-3.0, see [LICENSE](LICENSE). Copyright © 2026 Vikash Singh Thakur.
+
+The person detection model in `person_model.h` comes from [TensorFlow Lite Micro](https://github.com/tensorflow/tflite-micro) and is licensed under the Apache License 2.0.
